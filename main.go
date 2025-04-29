@@ -44,6 +44,17 @@ func handleConnection(conn net.Conn, store *redigo.RedigoDB) {
 			} else {
 				conn.Write([]byte("nil\n"))
 			}
+		case "SAVE":
+            filePath := ""
+            if len(parts) > 1 {
+                filePath = parts[1]
+            }
+            err := store.SaveToJSON(filePath)
+            if err != nil {
+                conn.Write([]byte(fmt.Sprintf("Error saving database: %v\n", err)))
+            } else {
+                conn.Write([]byte("Database saved successfully\n"))
+            }
 		default:
 			conn.Write([]byte(fmt.Sprintf("Unknown command '%v'.\n", parts[0])))
 		}
@@ -52,6 +63,13 @@ func handleConnection(conn net.Conn, store *redigo.RedigoDB) {
 
 func main() {
 	db := redigo.InitRedigo()
+
+	if err := db.LoadFromJSON(""); err != nil {
+        fmt.Printf("Error loading database: %v\n", err)
+    } else {
+        fmt.Println("Database loaded successfully")
+    }
+
 	ln, err := net.Listen("tcp", ":6379")
 	if err != nil {
 		panic(err)
