@@ -2,9 +2,18 @@ package redigo
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
+	"time"
+)
+
+const (
+    autosaveInterval = 5 * time.Minute
+    timestampFormat = "20060102-150405" // YYYYMMDD-HHMMSS
+    maxBackups = 10
 )
 
 func getDataDirectory() (string, error) {
@@ -22,95 +31,151 @@ func getDataDirectory() (string, error) {
     return dataDir, nil
 }
 
-func getDataFilePath() (string, error) {
+func getLatestDataFile() (string, error) {
     dataDir, err := getDataDirectory()
     if err != nil {
         return "", err
     }
-    return filepath.Join(dataDir, "data.json"), nil
+    
+    pattern := filepath.Join(dataDir, "data-*.json")
+    files, err := filepath.Glob(pattern)
+    if err != nil {
+        return "", err
+    }
+    
+    if len(files) == 0 {
+        return "", nil
+    }
+    
+    sort.Slice(files, func(i, j int) bool {
+        return files[i] > files[j]
+    })
+    
+    return files[0], nil
+}
+
+func getNewDataFilePath() (string, error) {
+    dataDir, err := getDataDirectory()
+    if err != nil {
+        return "", err
+    }
+    
+    timestamp := time.Now().Format(timestampFormat)
+    return filepath.Join(dataDir, fmt.Sprintf("data-%s.json", timestamp)), nil
+}
+
+func cleanupOldBackups() error {
+    dataDir, err := getDataDirectory()
+    if err != nil {
+        return err
+    }
+    
+    pattern := filepath.Join(dataDir, "data-*.json")
+    files, err := filepath.Glob(pattern)
+    if err != nil {
+        return err
+    }
+    
+    if len(files) <= maxBackups {
+        return nil
+    }
+    
+    sort.Strings(files)
+    
+    for i := 0; i < len(files)-maxBackups; i++ {
+        if err := os.Remove(files[i]); err != nil {
+            return err
+        }
+    }
+    
+    return nil
+}
+
+func (db *RedigoDB) StartAutosave() {
+    ticker := time.NewTicker(autosaveInterval)
+    go func() {
+        for range ticker.C {
+            if err := db.SaveToJSON(""); err != nil {
+                fmt.Printf("Autosave error: %v\n", err)
+            } else {
+                fmt.Println("Database autosaved successfully")
+            }
+        }
+    }()
 }
 
 func (db *RedigoDB) SaveToJSON(_ string) error {
     db.mu.Lock()
     defer db.mu.Unlock()
-
-    filePath, err := getDataFilePath()
+    
+    filePath, err := getNewDataFilePath()
     if err != nil {
         return err
     }
-
+    
     data := make(map[string]interface{})
-
-    existingData := make(map[string]interface{})
-    if _, err := os.Stat(filePath); err == nil {
-        fileData, err := os.ReadFile(filePath)
-        if err == nil {
-            err = json.Unmarshal(fileData, &existingData)
-            if err == nil {
-                data = existingData
-            }
-        }
-    }
-
+    
     for key, value := range db.store {
-        if _, exists := existingData[key]; !exists {
-            switch v := value.(type) {
-            case RedigoString:
-                data[key] = map[string]interface{}{
-                    "type":  "string",
-                    "value": string(v),
-                }
-            case RedigoBool:
-                data[key] = map[string]interface{}{
-                    "type":  "bool",
-                    "value": bool(v),
-                }
-            case RedigoInt:
-                data[key] = map[string]interface{}{
-                    "type":  "int",
-                    "value": int(v),
-                }
+        switch v := value.(type) {
+        case RedigoString:
+            data[key] = map[string]interface{}{
+                "type":  "string",
+                "value": string(v),
+            }
+        case RedigoBool:
+            data[key] = map[string]interface{}{
+                "type":  "bool",
+                "value": bool(v),
+            }
+        case RedigoInt:
+            data[key] = map[string]interface{}{
+                "type":  "int",
+                "value": int(v),
             }
         }
     }
-
+    
     jsonData, err := json.MarshalIndent(data, "", "  ")
     if err != nil {
         return err
     }
-
-    return os.WriteFile(filePath, jsonData, 0644)
+    
+    if err := os.WriteFile(filePath, jsonData, 0644); err != nil {
+        return err
+    }
+    
+    return cleanupOldBackups()
 }
 
 func (db *RedigoDB) LoadFromJSON(_ string) error {
-    filePath, err := getDataFilePath()
+    filePath, err := getLatestDataFile()
     if err != nil {
         return err
     }
-
-    if _, err := os.Stat(filePath); os.IsNotExist(err) {
+    
+    if filePath == "" {
         return nil
     }
-
+    
     fileData, err := os.ReadFile(filePath)
     if err != nil {
         return err
     }
-
+    
     var data map[string]map[string]interface{}
     if err := json.Unmarshal(fileData, &data); err != nil {
         return err
     }
-
+    
     db.mu.Lock()
     defer db.mu.Unlock()
-
+    
     for key, item := range data {
         typeStr, ok := item["type"].(string)
         if !ok {
             continue
         }
-
+        
         switch typeStr {
         case "string":
             if strValue, ok := item["value"].(string); ok {
@@ -126,23 +191,25 @@ func (db *RedigoDB) LoadFromJSON(_ string) error {
             }
         }
     }
-
+    
     return nil
 }
 
 type RedigoStorableValues interface {
-	isRedigoValue()
+    isRedigoValue()
 }
 
 type RedigoDB struct {
-	store map[string]RedigoStorableValues
-	mu    sync.Mutex
+    store map[string]RedigoStorableValues
+    mu    sync.Mutex
 }
 
 func InitRedigo() *RedigoDB {
-	return &RedigoDB{
-		store: make(map[string]RedigoStorableValues),
-	}
+    db := &RedigoDB{
+        store: make(map[string]RedigoStorableValues),
+    }
+    db.StartAutosave()
+    return db
 }
 
 func (db *RedigoDB) Set(key string, value RedigoStorableValues) {

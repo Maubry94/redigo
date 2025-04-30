@@ -62,27 +62,27 @@ func handleConnection(conn net.Conn, store *redigo.RedigoDB) {
 }
 
 func main() {
-	db := redigo.InitRedigo()
+    db := redigo.InitRedigo()
 
-	if err := db.LoadFromJSON(""); err != nil {
+    if err := db.LoadFromJSON(""); err != nil {
         fmt.Printf("Error loading database: %v\n", err)
     } else {
         fmt.Println("Database loaded successfully")
     }
 
-	ln, err := net.Listen("tcp", ":6379")
-	if err != nil {
-		panic(err)
-	}
-	defer ln.Close()
+    ln, err := net.Listen("tcp", ":6379")
+    if err != nil {
+        panic(err)
+    }
+    defer ln.Close()
 
-	fmt.Println("Redigo server started on :6379")
+    fmt.Println("Redigo server started on :6379 (with autosave enabled)")
 
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			continue
-		}
-		go handleConnection(conn, db)
-	}
+    for {
+        conn, err := ln.Accept()
+        if err != nil {
+            continue
+        }
+        go handleConnection(conn, db)
+    }
 }
