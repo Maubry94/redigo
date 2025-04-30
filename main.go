@@ -3,8 +3,10 @@ package main
 import (
 	"fmt"
 	"net"
-	"redigo/core/redigo"
 	"strings"
+
+	"redigo/core/envs"
+	"redigo/core/redigo"
 )
 
 // handleConnection processes incoming client connections and handles their commands
@@ -79,6 +81,8 @@ func handleConnection(conn net.Conn, store *redigo.RedigoDB) {
 
 // main initializes and runs the Redigo server
 func main() {
+    envs.LoadEnv()
+
     // Initialize the database with hybrid persistence (AOF + snapshots)
     db, err := redigo.InitRedigo()
     if err != nil {
@@ -87,7 +91,7 @@ func main() {
     }
     defer db.CloseAOF() // Ensure proper cleanup on shutdown
 
-    fmt.Println("Redigo server started on :6379 (hybrid persistence: AOF + snapshots)")
+    fmt.Println("Redigo server started on :6379")
 
     // Start TCP server on Redis standard port
     ln, err := net.Listen("tcp", ":6379")

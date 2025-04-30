@@ -11,18 +11,16 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"redigo/core/envs"
 )
 
 const (
     aofFilename      = "appendonly.aof"
     snapshotPrefix   = "snapshot-"
     snapshotSuffix   = ".json"
-    autosaveInterval = 5 * time.Minute
-    maxSnapshots     = 5
+    timestampFormat  = "20060102-150405"
 )
-
-// Format used for timestamps in snapshot filenames (YYYYMMDD-HHMMSS)
-const timestampFormat = "20060102-150405"
 
 // Command represents a database operation to be persisted in the AOF
 type Command struct {
@@ -33,17 +31,28 @@ type Command struct {
     Timestamp int64       // Unix timestamp when the command was executed
 }
 
+// Variables globales pour stocker la configuration
+var config envs.Envs
+
 // RedigoDB is the main database structure that manages data storage and persistence
 type RedigoDB struct {
     store map[string]RedigoStorableValues // In-memory key-value store
     mu    sync.Mutex                      // Mutex for thread-safe access to the store
     aof   *os.File                        // File descriptor for the AOF
     aofMu sync.Mutex                      // Separate mutex for AOF operations
+    cfg   envs.Envs
 }
 
 // getDataDirectory returns the path to the directory where database files are stored
 // Creates the directory if it doesn't exist
 func getDataDirectory() (string, error) {
+    if config.DataDirectory != "" {
+        if err := os.MkdirAll(config.DataDirectory, 0755); err != nil {
+            return "", err
+        }
+        return config.DataDirectory, nil
+    }
+    
     homeDir, err := os.UserHomeDir()
     if err != nil {
         return "", err
@@ -107,12 +116,15 @@ func getLatestSnapshotPath() (string, error) {
 // InitRedigo initializes the database, loads data from the most recent snapshot,
 // replays the AOF, and starts background persistence processes
 func InitRedigo() (*RedigoDB, error) {
+    config = envs.Gets()
+
     db := &RedigoDB{
         store: make(map[string]RedigoStorableValues),
+        cfg:   config,
     }
     
     if err := db.LoadFromSnapshot(); err != nil {
-        return nil, fmt.Errorf("erreur lors du chargement du snapshot: %w", err)
+        return nil, fmt.Errorf("error loading snapshot: %w", err)
     }
     
     aofPath, err := getAOFPath()
@@ -127,7 +139,7 @@ func InitRedigo() (*RedigoDB, error) {
     db.aof = aof
     
     if err := db.LoadFromAOF(); err != nil {
-        return nil, fmt.Errorf("erreur lors du chargement de l'AOF: %w", err)
+        return nil, fmt.Errorf("error loading AOF: %w", err)
     }
     
     go db.startAOFCompaction()
@@ -235,7 +247,7 @@ func (db *RedigoDB) LoadFromAOF() error {
         
         var cmd Command
         if err := json.Unmarshal([]byte(line), &cmd); err != nil {
-            fmt.Printf("Erreur de lecture à la ligne %d: %v\n", lineNum, err)
+            fmt.Printf("Error reading line %d: %v\n", lineNum, err)
             continue
         }
         
@@ -280,12 +292,12 @@ func (db *RedigoDB) LoadFromAOF() error {
 // startSnapshotScheduler runs in the background and creates periodic snapshots
 // of the database state according to the autosaveInterval
 func (db *RedigoDB) startSnapshotScheduler() {
-    ticker := time.NewTicker(autosaveInterval)
+    ticker := time.NewTicker(db.cfg.AutosaveInterval)
     for range ticker.C {
         if err := db.CreateSnapshot(); err != nil {
-            fmt.Printf("Erreur lors de la création du snapshot: %v\n", err)
+            fmt.Printf("Error creating snapshot: %v\n", err)
         } else {
-            fmt.Println("Snapshot créé avec succès")
+            fmt.Println("Snapshot created successfully")
             db.cleanupOldSnapshots()
         }
     }
@@ -348,7 +360,7 @@ func (db *RedigoDB) cleanupOldSnapshots() error {
         return err
     }
     
-    if len(matches) <= maxSnapshots {
+    if len(matches) <= db.cfg.MaxSnapshots {
         return nil
     }
     
@@ -356,11 +368,11 @@ func (db *RedigoDB) cleanupOldSnapshots() error {
         return matches[i] > matches[j]
     })
     
-    for i := maxSnapshots; i < len(matches); i++ {
+    for i := db.cfg.MaxSnapshots; i < len(matches); i++ {
         if err := os.Remove(matches[i]); err != nil {
             return err
         }
-        fmt.Printf("Ancien snapshot supprimé: %s\n", filepath.Base(matches[i]))
+        fmt.Printf("Old snapshot deleted: %s\n", filepath.Base(matches[i]))
     }
     
     return nil
@@ -415,19 +427,19 @@ func (db *RedigoDB) LoadFromSnapshot() error {
         }
     }
     
-    fmt.Printf("Base de données chargée depuis le snapshot: %s\n", filepath.Base(snapshotPath))
+    fmt.Printf("Database loaded from snapshot: %s\n", filepath.Base(snapshotPath))
     return nil
 }
 
 // startAOFCompaction runs in the background and periodically compacts the AOF file
 // by rewriting it to only contain the commands needed for the current state
 func (db *RedigoDB) startAOFCompaction() {
-    ticker := time.NewTicker(autosaveInterval * 2)
+    ticker := time.NewTicker(db.cfg.AofCompactionInterval)
     for range ticker.C {
         if err := db.compactAOF(); err != nil {
-            fmt.Printf("Erreur lors du compactage AOF: %v\n", err)
+            fmt.Printf("Error during AOF compaction: %v\n", err)
         } else {
-            fmt.Println("Compactage AOF réussi")
+            fmt.Println("AOF compaction successful")
         }
     }
 }
@@ -519,15 +531,15 @@ func (db *RedigoDB) compactAOF() error {
 // Used for the SAVE command to manually trigger persistence
 func (db *RedigoDB) ForceSave() error {
     if err := db.CreateSnapshot(); err != nil {
-        return fmt.Errorf("erreur lors de la création du snapshot: %w", err)
+        return fmt.Errorf("error creating snapshot: %w", err)
     }
     
     if err := db.compactAOF(); err != nil {
-        return fmt.Errorf("erreur lors du compactage de l'AOF: %w", err)
+        return fmt.Errorf("error during AOF compaction: %w", err)
     }
     
     if err := db.cleanupOldSnapshots(); err != nil {
-        return fmt.Errorf("erreur lors du nettoyage des anciens snapshots: %w", err)
+        return fmt.Errorf("error cleaning up old snapshots: %w", err)
     }
     
     return nil
