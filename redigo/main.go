@@ -28,6 +28,7 @@ type Command struct {
     Key       string      // Key on which the operation is performed
     ValueType string      // Data type of the value (string, int, bool)
     Value     interface{} // Actual value being stored
+    TTL       int64       // Time-to-live in seconds (0 means no expiration)
     Timestamp int64       // Unix timestamp when the command was executed
 }
 
@@ -36,11 +37,12 @@ var config envs.Envs
 
 // RedigoDB is the main database structure that manages data storage and persistence
 type RedigoDB struct {
-    store map[string]RedigoStorableValues // In-memory key-value store
-    mu    sync.Mutex                      // Mutex for thread-safe access to the store
-    aof   *os.File                        // File descriptor for the AOF
-    aofMu sync.Mutex                      // Separate mutex for AOF operations
-    cfg   envs.Envs
+    store      map[string]RedigoStorableValues // In-memory key-value store
+    expiry     map[string]int64                // Map of key expiration timestamps
+    mu         sync.Mutex                      // Mutex for thread-safe access to the store
+    aof        *os.File                        // File descriptor for the AOF
+    aofMu      sync.Mutex                      // Separate mutex for AOF operations
+    cfg        envs.Envs                       // Configuration settings
 }
 
 // getDataDirectory returns the path to the directory where database files are stored
@@ -119,8 +121,9 @@ func InitRedigo() (*RedigoDB, error) {
     config = envs.Gets()
 
     db := &RedigoDB{
-        store: make(map[string]RedigoStorableValues),
-        cfg:   config,
+        store:  make(map[string]RedigoStorableValues),
+        expiry: make(map[string]int64),
+        cfg:    config,
     }
     
     if err := db.LoadFromSnapshot(); err != nil {
@@ -144,6 +147,9 @@ func InitRedigo() (*RedigoDB, error) {
     
     go db.startAOFCompaction()
     go db.startSnapshotScheduler()
+    go db.startExpiryChecker()
+    go db.startSnapshotScheduler()
+    go db.startAOFCompaction()
     
     return db, nil
 }
@@ -175,12 +181,25 @@ func (db *RedigoDB) appendToAOF(cmd Command) error {
 }
 
 // Set stores a value associated with the given key and persists the operation
-// Thread-safe through mutex locking
-func (db *RedigoDB) Set(key string, value RedigoStorableValues) error {
+// If ttl > 0, the key will expire after ttl seconds
+func (db *RedigoDB) Set(key string, value RedigoStorableValues, ttl int64) error {
     db.mu.Lock()
+    
+    // Store the value
     db.store[key] = value
+    
+    // Set expiry if needed
+    if ttl > 0 {
+        expireTime := time.Now().Unix() + ttl
+        db.expiry[key] = expireTime
+    } else {
+        // If ttl is 0, remove any existing expiration
+        delete(db.expiry, key)
+    }
+    
     db.mu.Unlock()
     
+    // Déterminer le type et la valeur à stocker dans l'AOF
     var valueType string
     var rawValue interface{}
     
@@ -196,11 +215,13 @@ func (db *RedigoDB) Set(key string, value RedigoStorableValues) error {
         rawValue = int(v)
     }
     
+    // Créer et enregistrer la commande
     cmd := Command{
         Name:      "SET",
         Key:       key,
         ValueType: valueType,
         Value:     rawValue,
+        TTL:       ttl,
         Timestamp: time.Now().Unix(),
     }
     
@@ -212,8 +233,112 @@ func (db *RedigoDB) Set(key string, value RedigoStorableValues) error {
 func (db *RedigoDB) Get(key string) (RedigoStorableValues, bool) {
     db.mu.Lock()
     defer db.mu.Unlock()
+    
+    // Check if the key has expired
+    if expireTime, exists := db.expiry[key]; exists && time.Now().Unix() > expireTime {
+        delete(db.store, key)
+        delete(db.expiry, key)
+        return nil, false
+    }
+    
     val, ok := db.store[key]
     return val, ok
+}
+
+// GetTTL returns the remaining time-to-live for a key in seconds
+// Returns:
+// - remaining seconds (>0) if the key has a TTL
+// - 0 if the key exists but has no TTL
+// - -1 if the key doesn't exist
+func (db *RedigoDB) GetTTL(key string) (int64, bool) {
+    db.mu.Lock()
+    defer db.mu.Unlock()
+    
+    // Check if key exists
+    _, keyExists := db.store[key]
+    if !keyExists {
+        return -1, false
+    }
+    
+    // Check if key has an expiration
+    expireTime, hasExpiry := db.expiry[key]
+    if !hasExpiry {
+        return 0, true // Exists but has no expiration
+    }
+    
+    // Calculate remaining time
+    now := time.Now().Unix()
+    remainingTime := expireTime - now
+    
+    // If expired, the key should have been cleaned up by expiryChecker
+    // But just in case, handle it here
+    if remainingTime <= 0 {
+        delete(db.store, key)
+        delete(db.expiry, key)
+        return -1, false
+    }
+    
+    return remainingTime, true
+}
+
+// SetExpiry sets an expiration time on a key
+// Returns true if the timeout was set, false if the key doesn't exist
+func (db *RedigoDB) SetExpiry(key string, seconds int64) bool {
+    db.mu.Lock()
+    defer db.mu.Unlock()
+    
+    // Check if key exists
+    _, exists := db.store[key]
+    if !exists {
+        return false
+    }
+    
+    // Set expiry
+    if seconds > 0 {
+        db.expiry[key] = time.Now().Unix() + seconds
+    } else if seconds == 0 {
+        // Remove expiration if seconds = 0
+        delete(db.expiry, key)
+    }
+    
+    // Persist this command to AOF
+    cmd := Command{
+        Name:      "EXPIRE",
+        Key:       key,
+        Value:     seconds,
+        Timestamp: time.Now().Unix(),
+    }
+    
+    db.appendToAOF(cmd)
+    
+    return true
+}
+
+// startExpiryChecker runs in the background and removes expired keys
+func (db *RedigoDB) startExpiryChecker() {
+    ticker := time.NewTicker(1 * time.Second)
+    go func() {
+        for range ticker.C {
+            now := time.Now().Unix()
+            
+            // Create a list of keys to delete
+            var expiredKeys []string
+            
+            db.mu.Lock()
+            for key, expireTime := range db.expiry {
+                if now > expireTime {
+                    expiredKeys = append(expiredKeys, key)
+                }
+            }
+            
+            // Remove expired keys
+            for _, key := range expiredKeys {
+                delete(db.store, key)
+                delete(db.expiry, key)
+            }
+            db.mu.Unlock()
+        }
+    }()
 }
 
 // LoadFromAOF replays all operations from the AOF file to rebuild the in-memory database state
@@ -224,6 +349,7 @@ func (db *RedigoDB) LoadFromAOF() error {
         return err
     }
     
+    // Check if the AOF file exists
     if _, err := os.Stat(aofPath); os.IsNotExist(err) {
         return nil
     }
@@ -236,18 +362,20 @@ func (db *RedigoDB) LoadFromAOF() error {
     
     scanner := bufio.NewScanner(file)
     lineNum := 0
+    now := time.Now().Unix()
     
     for scanner.Scan() {
         lineNum++
         line := scanner.Text()
         
+        // Ignore empty lines
         if len(strings.TrimSpace(line)) == 0 {
             continue
         }
         
         var cmd Command
         if err := json.Unmarshal([]byte(line), &cmd); err != nil {
-            fmt.Printf("Error reading line %d: %v\n", lineNum, err)
+            fmt.Printf("Erreur de lecture à la ligne %d: %v\n", lineNum, err)
             continue
         }
         
@@ -277,8 +405,44 @@ func (db *RedigoDB) LoadFromAOF() error {
             if value != nil {
                 db.mu.Lock()
                 db.store[cmd.Key] = value
+                
+                if cmd.TTL > 0 {
+                    elapsedTime := now - cmd.Timestamp
+                    remainingTTL := cmd.TTL - elapsedTime
+                    
+                    if remainingTTL > 0 {
+                        db.expiry[cmd.Key] = now + remainingTTL
+                    } else {
+                        delete(db.store, cmd.Key)
+                        delete(db.expiry, cmd.Key)
+                    }
+                } else if cmd.TTL == 0 {
+                    delete(db.expiry, cmd.Key)
+                }
+                
                 db.mu.Unlock()
             }
+        } else if cmd.Name == "DEL" {
+            db.mu.Lock()
+            delete(db.store, cmd.Key)
+            delete(db.expiry, cmd.Key)
+            db.mu.Unlock()
+        } else if cmd.Name == "EXPIRE" {
+            db.mu.Lock() 
+            if _, exists := db.store[cmd.Key]; exists {
+                if seconds, ok := cmd.Value.(float64); ok {
+                    elapsedTime := now - cmd.Timestamp
+                    remainingTime := int64(seconds) - elapsedTime
+                    
+                    if remainingTime > 0 {
+                        db.expiry[cmd.Key] = now + remainingTime
+                    } else {
+                        delete(db.store, cmd.Key)
+                        delete(db.expiry, cmd.Key)
+                    }
+                }
+            }
+            db.mu.Unlock()
         }
     }
     
