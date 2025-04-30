@@ -21,23 +21,28 @@ const (
     maxSnapshots     = 5
 )
 
-const timestampFormat = "20060102-150405" // YYYYMMDD-HHMMSS
+// Format used for timestamps in snapshot filenames (YYYYMMDD-HHMMSS)
+const timestampFormat = "20060102-150405"
 
+// Command represents a database operation to be persisted in the AOF
 type Command struct {
-    Name      string
-    Key       string
-    ValueType string
-    Value     interface{}
-    Timestamp int64
+    Name      string      // Operation type (e.g., "SET")
+    Key       string      // Key on which the operation is performed
+    ValueType string      // Data type of the value (string, int, bool)
+    Value     interface{} // Actual value being stored
+    Timestamp int64       // Unix timestamp when the command was executed
 }
 
+// RedigoDB is the main database structure that manages data storage and persistence
 type RedigoDB struct {
-    store map[string]RedigoStorableValues
-    mu    sync.Mutex
-    aof   *os.File
-    aofMu sync.Mutex
+    store map[string]RedigoStorableValues // In-memory key-value store
+    mu    sync.Mutex                      // Mutex for thread-safe access to the store
+    aof   *os.File                        // File descriptor for the AOF
+    aofMu sync.Mutex                      // Separate mutex for AOF operations
 }
 
+// getDataDirectory returns the path to the directory where database files are stored
+// Creates the directory if it doesn't exist
 func getDataDirectory() (string, error) {
     homeDir, err := os.UserHomeDir()
     if err != nil {
@@ -53,6 +58,7 @@ func getDataDirectory() (string, error) {
     return dataDir, nil
 }
 
+// getAOFPath returns the full path to the AOF file
 func getAOFPath() (string, error) {
     dataDir, err := getDataDirectory()
     if err != nil {
@@ -62,6 +68,7 @@ func getAOFPath() (string, error) {
     return filepath.Join(dataDir, aofFilename), nil
 }
 
+// getNewSnapshotPath generates a path for a new snapshot with current timestamp
 func getNewSnapshotPath() (string, error) {
     dataDir, err := getDataDirectory()
     if err != nil {
@@ -72,6 +79,8 @@ func getNewSnapshotPath() (string, error) {
     return filepath.Join(dataDir, fmt.Sprintf("%s%s%s", snapshotPrefix, timestamp, snapshotSuffix)), nil
 }
 
+// getLatestSnapshotPath returns the path to the most recent snapshot file
+// Returns empty string if no snapshots exist
 func getLatestSnapshotPath() (string, error) {
     dataDir, err := getDataDirectory()
     if err != nil {
@@ -95,6 +104,8 @@ func getLatestSnapshotPath() (string, error) {
     return matches[0], nil
 }
 
+// InitRedigo initializes the database, loads data from the most recent snapshot,
+// replays the AOF, and starts background persistence processes
 func InitRedigo() (*RedigoDB, error) {
     db := &RedigoDB{
         store: make(map[string]RedigoStorableValues),
@@ -125,6 +136,7 @@ func InitRedigo() (*RedigoDB, error) {
     return db, nil
 }
 
+// CloseAOF properly closes the AOF file
 func (db *RedigoDB) CloseAOF() error {
     if db.aof != nil {
         return db.aof.Close()
@@ -132,6 +144,8 @@ func (db *RedigoDB) CloseAOF() error {
     return nil
 }
 
+// appendToAOF appends a command to the AOF file in JSON format
+// This is called after every write operation to ensure durability
 func (db *RedigoDB) appendToAOF(cmd Command) error {
     db.aofMu.Lock()
     defer db.aofMu.Unlock()
@@ -148,6 +162,8 @@ func (db *RedigoDB) appendToAOF(cmd Command) error {
     return db.aof.Sync()
 }
 
+// Set stores a value associated with the given key and persists the operation
+// Thread-safe through mutex locking
 func (db *RedigoDB) Set(key string, value RedigoStorableValues) error {
     db.mu.Lock()
     db.store[key] = value
@@ -179,6 +195,8 @@ func (db *RedigoDB) Set(key string, value RedigoStorableValues) error {
     return db.appendToAOF(cmd)
 }
 
+// Get retrieves a value associated with the given key
+// Returns the value and a boolean indicating if the key exists
 func (db *RedigoDB) Get(key string) (RedigoStorableValues, bool) {
     db.mu.Lock()
     defer db.mu.Unlock()
@@ -186,6 +204,8 @@ func (db *RedigoDB) Get(key string) (RedigoStorableValues, bool) {
     return val, ok
 }
 
+// LoadFromAOF replays all operations from the AOF file to rebuild the in-memory database state
+// Called during startup to recover data since the last snapshot
 func (db *RedigoDB) LoadFromAOF() error {
     aofPath, err := getAOFPath()
     if err != nil {
@@ -257,6 +277,8 @@ func (db *RedigoDB) LoadFromAOF() error {
     return nil
 }
 
+// startSnapshotScheduler runs in the background and creates periodic snapshots
+// of the database state according to the autosaveInterval
 func (db *RedigoDB) startSnapshotScheduler() {
     ticker := time.NewTicker(autosaveInterval)
     for range ticker.C {
@@ -269,6 +291,8 @@ func (db *RedigoDB) startSnapshotScheduler() {
     }
 }
 
+// CreateSnapshot creates a point-in-time snapshot of the current database state
+// and saves it as a JSON file with timestamp in the filename
 func (db *RedigoDB) CreateSnapshot() error {
     db.mu.Lock()
     defer db.mu.Unlock()
@@ -310,6 +334,8 @@ func (db *RedigoDB) CreateSnapshot() error {
     return os.WriteFile(snapshotPath, jsonData, 0644)
 }
 
+// cleanupOldSnapshots removes old snapshot files, keeping only the most recent ones
+// according to the maxSnapshots configuration
 func (db *RedigoDB) cleanupOldSnapshots() error {
     dataDir, err := getDataDirectory()
     if err != nil {
@@ -340,6 +366,8 @@ func (db *RedigoDB) cleanupOldSnapshots() error {
     return nil
 }
 
+// LoadFromSnapshot loads the database state from the most recent snapshot file
+// Called during startup before applying the AOF
 func (db *RedigoDB) LoadFromSnapshot() error {
     snapshotPath, err := getLatestSnapshotPath()
     if err != nil {
@@ -391,6 +419,8 @@ func (db *RedigoDB) LoadFromSnapshot() error {
     return nil
 }
 
+// startAOFCompaction runs in the background and periodically compacts the AOF file
+// by rewriting it to only contain the commands needed for the current state
 func (db *RedigoDB) startAOFCompaction() {
     ticker := time.NewTicker(autosaveInterval * 2)
     for range ticker.C {
@@ -402,6 +432,8 @@ func (db *RedigoDB) startAOFCompaction() {
     }
 }
 
+// compactAOF rewrites the AOF file to contain only the current state of the database
+// This prevents the AOF file from growing indefinitely
 func (db *RedigoDB) compactAOF() error {
     db.mu.Lock()
     defer db.mu.Unlock()
@@ -483,6 +515,8 @@ func (db *RedigoDB) compactAOF() error {
     return nil
 }
 
+// ForceSave creates a snapshot, compacts the AOF, and cleans up old snapshots
+// Used for the SAVE command to manually trigger persistence
 func (db *RedigoDB) ForceSave() error {
     if err := db.CreateSnapshot(); err != nil {
         return fmt.Errorf("erreur lors de la création du snapshot: %w", err)
@@ -499,15 +533,20 @@ func (db *RedigoDB) ForceSave() error {
     return nil
 }
 
+// RedigoStorableValues is an interface for all types that can be stored in the database
+// It acts as a type marker to ensure type safety
 type RedigoStorableValues interface {
     isRedigoValue()
 }
 
+// RedigoString represents a string value in the database
 type RedigoString string
 func (s RedigoString) isRedigoValue() {}
 
+// RedigoBool represents a boolean value in the database
 type RedigoBool bool
 func (b RedigoBool) isRedigoValue() {}
 
+// RedigoInt represents an integer value in the database
 type RedigoInt int
 func (i RedigoInt) isRedigoValue() {}
