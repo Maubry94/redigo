@@ -10,6 +10,7 @@ import (
 )
 
 type Envs struct {
+    RedigoPort            string           `env:"REDIGO_PORT" envDefault:"6379"`
     AutosaveInterval      time.Duration `env:"AUTOSAVE_INTERVAL" envDefault:"5m"`
     AofCompactionInterval time.Duration `env:"AOF_COMPACTION_INTERVAL" envDefault:"10m"`  
     MaxSnapshots          int           `env:"MAX_SNAPSHOTS" envDefault:"5"`

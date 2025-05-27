@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -27,7 +26,7 @@ type Command struct {
     Name      string      // Operation type (e.g., "SET")
     Key       string      // Key on which the operation is performed
     ValueType string      // Data type of the value (string, int, bool)
-    Value     interface{} // Actual value being stored
+    Value     any         // Actual value being stored
     TTL       int64       // Time-to-live in seconds (0 means no expiration)
     Timestamp int64       // Unix timestamp when the command was executed
 }
@@ -39,10 +38,12 @@ var config envs.Envs
 type RedigoDB struct {
     store      map[string]RedigoStorableValues // In-memory key-value store
     expiry     map[string]int64                // Map of key expiration timestamps
-    mu         sync.Mutex                      // Mutex for thread-safe access to the store
-    aof        *os.File                        // File descriptor for the AOF
-    aofMu      sync.Mutex                      // Separate mutex for AOF operations
-    cfg        envs.Envs                       // Configuration settings
+    storeMutex sync.Mutex                      // Mutex for thread-safe access to the store
+    aofFile    *os.File                        // File descriptor for the AOF
+    aofMutex    sync.Mutex                      // Separate mutex for AOF operations
+    envs        envs.Envs                       // Configuration settings
+    aofCommandsBuffer  []string    // Buffer pour stocker les commandes avant écriture
+    aofCommandsBufferMutex   sync.Mutex  // Mutex pour protéger le buffer
 }
 
 // getDataDirectory returns the path to the directory where database files are stored
@@ -118,12 +119,13 @@ func getLatestSnapshotPath() (string, error) {
 // InitRedigo initializes the database, loads data from the most recent snapshot,
 // replays the AOF, and starts background persistence processes
 func InitRedigo() (*RedigoDB, error) {
-    config = envs.Gets()
+    envs := envs.Gets()
 
     db := &RedigoDB{
         store:  make(map[string]RedigoStorableValues),
         expiry: make(map[string]int64),
-        cfg:    config,
+        envs:    envs,
+        aofCommandsBuffer:  make([]string, 0),
     }
     
     if err := db.LoadFromSnapshot(); err != nil {
@@ -139,67 +141,98 @@ func InitRedigo() (*RedigoDB, error) {
     if err != nil {
         return nil, err
     }
-    db.aof = aof
+    db.aofFile = aof
     
     if err := db.LoadFromAOF(); err != nil {
         return nil, fmt.Errorf("error loading AOF: %w", err)
     }
     
-    go db.startAOFCompaction()
+    go db.startWriteBufferInAOF()
     go db.startSnapshotScheduler()
     go db.startExpiryChecker()
-    go db.startSnapshotScheduler()
-    go db.startAOFCompaction()
+    go db.startBufferFlusher()
     
     return db, nil
 }
 
 // CloseAOF properly closes the AOF file
 func (db *RedigoDB) CloseAOF() error {
-    if db.aof != nil {
-        return db.aof.Close()
+    if db.aofFile != nil {
+        return db.aofFile.Close()
     }
     return nil
 }
 
-// appendToAOF appends a command to the AOF file in JSON format
+// addCommandsToAOFBuffer appends a command to the AOF file in JSON format
 // This is called after every write operation to ensure durability
-func (db *RedigoDB) appendToAOF(cmd Command) error {
-    db.aofMu.Lock()
-    defer db.aofMu.Unlock()
-    
+func (db *RedigoDB) addCommandsToAOFBuffer(cmd Command) error {
     jsonCmd, err := json.Marshal(cmd)
     if err != nil {
         return err
     }
+
+    db.aofCommandsBufferMutex.Lock()
+    db.aofCommandsBuffer = append(db.aofCommandsBuffer, string(jsonCmd))
+    db.aofCommandsBufferMutex.Unlock()
     
-    if _, err := db.aof.WriteString(string(jsonCmd) + "\n"); err != nil {
-        return err
+    return nil
+}
+
+func (db *RedigoDB) flushBuffer() error {
+    db.aofCommandsBufferMutex.Lock()
+    if len(db.aofCommandsBuffer) == 0 {
+        db.aofCommandsBufferMutex.Unlock()
+        return nil
     }
     
-    return db.aof.Sync()
+    aofBufferCommands := make([]string, len(db.aofCommandsBuffer))
+    copy(aofBufferCommands, db.aofCommandsBuffer)
+    db.aofCommandsBuffer = db.aofCommandsBuffer[:0]
+    db.aofCommandsBufferMutex.Unlock()
+
+    db.aofMutex.Lock()
+    defer db.aofMutex.Unlock()
+    
+    for _, cmd := range aofBufferCommands {
+        if _, err := db.aofFile.WriteString(cmd + "\n"); err != nil {
+            return err
+        }
+    }
+
+    return nil
+}
+
+func (db *RedigoDB) startBufferFlusher() {
+    ticker := time.NewTicker(1 * time.Second)
+    go func() {
+        for range ticker.C {
+            if err := db.flushBuffer(); err != nil {
+                fmt.Printf("Erreur lors de la vidange du buffer AOF: %v\n", err)
+            }
+        }
+    }()
 }
 
 // Set stores a value associated with the given key and persists the operation
 // If ttl > 0, the key will expire after ttl seconds
 func (db *RedigoDB) Set(key string, value RedigoStorableValues, ttl int64) error {
-    db.mu.Lock()
+    now := time.Now().Unix() // Capture le timestamp actuel une seule fois
+    
+    db.storeMutex.Lock()
     
     // Store the value
     db.store[key] = value
     
     // Set expiry if needed
     if ttl > 0 {
-        expireTime := time.Now().Unix() + ttl
+        expireTime := now + ttl  // Utilise le même timestamp que celui qui sera dans la commande
         db.expiry[key] = expireTime
     } else {
-        // If ttl is 0, remove any existing expiration
         delete(db.expiry, key)
     }
     
-    db.mu.Unlock()
+    db.storeMutex.Unlock()
     
-    // Déterminer le type et la valeur à stocker dans l'AOF
     var valueType string
     var rawValue interface{}
     
@@ -215,24 +248,24 @@ func (db *RedigoDB) Set(key string, value RedigoStorableValues, ttl int64) error
         rawValue = int(v)
     }
     
-    // Créer et enregistrer la commande
+    // Créer et enregistrer la commande avec le même timestamp
     cmd := Command{
         Name:      "SET",
         Key:       key,
         ValueType: valueType,
         Value:     rawValue,
-        TTL:       ttl,
-        Timestamp: time.Now().Unix(),
+        TTL:       ttl,        // Le TTL est préservé tel quel
+        Timestamp: now,        // Utilise le même timestamp que pour l'expiration
     }
     
-    return db.appendToAOF(cmd)
+    return db.addCommandsToAOFBuffer(cmd)
 }
 
 // Get retrieves a value associated with the given key
 // Returns the value and a boolean indicating if the key exists
 func (db *RedigoDB) Get(key string) (RedigoStorableValues, bool) {
-    db.mu.Lock()
-    defer db.mu.Unlock()
+    db.storeMutex.Lock()
+    defer db.storeMutex.Unlock()
     
     // Check if the key has expired
     if expireTime, exists := db.expiry[key]; exists && time.Now().Unix() > expireTime {
@@ -251,8 +284,8 @@ func (db *RedigoDB) Get(key string) (RedigoStorableValues, bool) {
 // - 0 if the key exists but has no TTL
 // - -1 if the key doesn't exist
 func (db *RedigoDB) GetTTL(key string) (int64, bool) {
-    db.mu.Lock()
-    defer db.mu.Unlock()
+    db.storeMutex.Lock()
+    defer db.storeMutex.Unlock()
     
     // Check if key exists
     _, keyExists := db.store[key]
@@ -284,8 +317,8 @@ func (db *RedigoDB) GetTTL(key string) (int64, bool) {
 // SetExpiry sets an expiration time on a key
 // Returns true if the timeout was set, false if the key doesn't exist
 func (db *RedigoDB) SetExpiry(key string, seconds int64) bool {
-    db.mu.Lock()
-    defer db.mu.Unlock()
+    db.storeMutex.Lock()
+    defer db.storeMutex.Unlock()
     
     // Check if key exists
     _, exists := db.store[key]
@@ -309,7 +342,7 @@ func (db *RedigoDB) SetExpiry(key string, seconds int64) bool {
         Timestamp: time.Now().Unix(),
     }
     
-    db.appendToAOF(cmd)
+    db.addCommandsToAOFBuffer(cmd)
     
     return true
 }
@@ -324,7 +357,7 @@ func (db *RedigoDB) startExpiryChecker() {
             // Create a list of keys to delete
             var expiredKeys []string
             
-            db.mu.Lock()
+            db.storeMutex.Lock()
             for key, expireTime := range db.expiry {
                 if now > expireTime {
                     expiredKeys = append(expiredKeys, key)
@@ -336,7 +369,7 @@ func (db *RedigoDB) startExpiryChecker() {
                 delete(db.store, key)
                 delete(db.expiry, key)
             }
-            db.mu.Unlock()
+            db.storeMutex.Unlock()
         }
     }()
 }
@@ -368,11 +401,6 @@ func (db *RedigoDB) LoadFromAOF() error {
         lineNum++
         line := scanner.Text()
         
-        // Ignore empty lines
-        if len(strings.TrimSpace(line)) == 0 {
-            continue
-        }
-        
         var cmd Command
         if err := json.Unmarshal([]byte(line), &cmd); err != nil {
             fmt.Printf("Erreur de lecture à la ligne %d: %v\n", lineNum, err)
@@ -403,32 +431,29 @@ func (db *RedigoDB) LoadFromAOF() error {
             }
             
             if value != nil {
-                db.mu.Lock()
+                db.storeMutex.Lock()
                 db.store[cmd.Key] = value
                 
                 if cmd.TTL > 0 {
-                    elapsedTime := now - cmd.Timestamp
-                    remainingTTL := cmd.TTL - elapsedTime
-                    
-                    if remainingTTL > 0 {
-                        db.expiry[cmd.Key] = now + remainingTTL
+                    // Calculer le temps d'expiration absolu basé sur le timestamp original
+                    expiryTime := cmd.Timestamp + cmd.TTL
+                    if expiryTime > now {
+                        db.expiry[cmd.Key] = expiryTime
                     } else {
+                        // Si la clé a déjà expiré, la supprimer
                         delete(db.store, cmd.Key)
                         delete(db.expiry, cmd.Key)
                     }
-                } else if cmd.TTL == 0 {
-                    delete(db.expiry, cmd.Key)
                 }
-                
-                db.mu.Unlock()
+                db.storeMutex.Unlock()
             }
         } else if cmd.Name == "DEL" {
-            db.mu.Lock()
+            db.storeMutex.Lock()
             delete(db.store, cmd.Key)
             delete(db.expiry, cmd.Key)
-            db.mu.Unlock()
+            db.storeMutex.Unlock()
         } else if cmd.Name == "EXPIRE" {
-            db.mu.Lock() 
+            db.storeMutex.Lock() 
             if _, exists := db.store[cmd.Key]; exists {
                 if seconds, ok := cmd.Value.(float64); ok {
                     elapsedTime := now - cmd.Timestamp
@@ -442,7 +467,7 @@ func (db *RedigoDB) LoadFromAOF() error {
                     }
                 }
             }
-            db.mu.Unlock()
+            db.storeMutex.Unlock()
         }
     }
     
@@ -456,7 +481,7 @@ func (db *RedigoDB) LoadFromAOF() error {
 // startSnapshotScheduler runs in the background and creates periodic snapshots
 // of the database state according to the autosaveInterval
 func (db *RedigoDB) startSnapshotScheduler() {
-    ticker := time.NewTicker(db.cfg.AutosaveInterval)
+    ticker := time.NewTicker(db.envs.AutosaveInterval)
     for range ticker.C {
         if err := db.CreateSnapshot(); err != nil {
             fmt.Printf("Error creating snapshot: %v\n", err)
@@ -467,11 +492,12 @@ func (db *RedigoDB) startSnapshotScheduler() {
     }
 }
 
+//TODO: Créer un seul snapshot (pas plusieurs avec timestamp) toutes les 2 min via startSnapshotScheduler (envs configurable) recup tous le contenue de l'AOF le mettre dans le snapshot et vider l'AOF
 // CreateSnapshot creates a point-in-time snapshot of the current database state
 // and saves it as a JSON file with timestamp in the filename
 func (db *RedigoDB) CreateSnapshot() error {
-    db.mu.Lock()
-    defer db.mu.Unlock()
+    db.storeMutex.Lock()
+    defer db.storeMutex.Unlock()
     
     snapshotPath, err := getNewSnapshotPath()
     if err != nil {
@@ -524,7 +550,7 @@ func (db *RedigoDB) cleanupOldSnapshots() error {
         return err
     }
     
-    if len(matches) <= db.cfg.MaxSnapshots {
+    if len(matches) <= db.envs.MaxSnapshots {
         return nil
     }
     
@@ -532,7 +558,7 @@ func (db *RedigoDB) cleanupOldSnapshots() error {
         return matches[i] > matches[j]
     })
     
-    for i := db.cfg.MaxSnapshots; i < len(matches); i++ {
+    for i := db.envs.MaxSnapshots; i < len(matches); i++ {
         if err := os.Remove(matches[i]); err != nil {
             return err
         }
@@ -564,8 +590,8 @@ func (db *RedigoDB) LoadFromSnapshot() error {
         return err
     }
     
-    db.mu.Lock()
-    defer db.mu.Unlock()
+    db.storeMutex.Lock()
+    defer db.storeMutex.Unlock()
     
     db.store = make(map[string]RedigoStorableValues)
     
@@ -595,100 +621,15 @@ func (db *RedigoDB) LoadFromSnapshot() error {
     return nil
 }
 
-// startAOFCompaction runs in the background and periodically compacts the AOF file
+// startWriteBufferInAOF runs in the background and periodically compacts the AOF file
 // by rewriting it to only contain the commands needed for the current state
-func (db *RedigoDB) startAOFCompaction() {
-    ticker := time.NewTicker(db.cfg.AofCompactionInterval)
+func (db *RedigoDB) startWriteBufferInAOF() {
+    ticker := time.NewTicker(db.envs.AofCompactionInterval)
     for range ticker.C {
-        if err := db.compactAOF(); err != nil {
-            fmt.Printf("Error during AOF compaction: %v\n", err)
-        } else {
-            fmt.Println("AOF compaction successful")
+        if err := db.flushBuffer(); err != nil {
+            fmt.Printf("Error during flushing AOF buffer: %v\n", err)
         }
     }
-}
-
-// compactAOF rewrites the AOF file to contain only the current state of the database
-// This prevents the AOF file from growing indefinitely
-func (db *RedigoDB) compactAOF() error {
-    db.mu.Lock()
-    defer db.mu.Unlock()
-    
-    aofPath, err := getAOFPath()
-    if err != nil {
-        return err
-    }
-    
-    tempPath := aofPath + ".temp"
-    tempFile, err := os.Create(tempPath)
-    if err != nil {
-        return err
-    }
-    
-    for key, value := range db.store {
-        var valueType string
-        var rawValue interface{}
-        
-        switch v := value.(type) {
-        case RedigoString:
-            valueType = "string"
-            rawValue = string(v)
-        case RedigoBool:
-            valueType = "bool"
-            rawValue = bool(v)
-        case RedigoInt:
-            valueType = "int"
-            rawValue = int(v)
-        }
-        
-        cmd := Command{
-            Name:      "SET",
-            Key:       key,
-            ValueType: valueType,
-            Value:     rawValue,
-            Timestamp: time.Now().Unix(),
-        }
-        
-        jsonCmd, err := json.Marshal(cmd)
-        if err != nil {
-            tempFile.Close()
-            os.Remove(tempPath)
-            return err
-        }
-        
-        if _, err := tempFile.WriteString(string(jsonCmd) + "\n"); err != nil {
-            tempFile.Close()
-            os.Remove(tempPath)
-            return err
-        }
-    }
-    
-    if err := tempFile.Close(); err != nil {
-        os.Remove(tempPath)
-        return err
-    }
-    
-    db.aofMu.Lock()
-    if err := db.aof.Close(); err != nil {
-        db.aofMu.Unlock()
-        os.Remove(tempPath)
-        return err
-    }
-    
-    if err := os.Rename(tempPath, aofPath); err != nil {
-        db.aofMu.Unlock()
-        return err
-    }
-    
-    aof, err := os.OpenFile(aofPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-    if err != nil {
-        db.aofMu.Unlock()
-        return err
-    }
-    db.aof = aof
-    db.aofMu.Unlock()
-    
-    return nil
 }
 
 // ForceSave creates a snapshot, compacts the AOF, and cleans up old snapshots
@@ -696,10 +637,6 @@ func (db *RedigoDB) compactAOF() error {
 func (db *RedigoDB) ForceSave() error {
     if err := db.CreateSnapshot(); err != nil {
         return fmt.Errorf("error creating snapshot: %w", err)
-    }
-    
-    if err := db.compactAOF(); err != nil {
-        return fmt.Errorf("error during AOF compaction: %w", err)
     }
     
     if err := db.cleanupOldSnapshots(); err != nil {

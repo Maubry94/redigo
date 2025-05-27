@@ -134,6 +134,11 @@ func handleConnection(conn net.Conn, store *redigo.RedigoDB) {
 func main() {
     envs.LoadEnv()
 
+    // Get port from environment variable or use default :6379
+    config := envs.Gets()
+    port := config.RedigoPort
+    
+
     // Initialize the database with hybrid persistence (AOF + snapshots)
     db, err := redigo.InitRedigo()
     if err != nil {
@@ -142,10 +147,10 @@ func main() {
     }
     defer db.CloseAOF() // Ensure proper cleanup on shutdown
 
-    fmt.Println("Redigo server started on :6379")
-
-    // Start TCP server on Redis standard port
-    ln, err := net.Listen("tcp", ":6379")
+    fmt.Printf("Redigo server started on :%s\n", port)
+    
+    // Start TCP server
+    ln, err := net.Listen("tcp", ":"+port)
     if err != nil {
         panic(err)
     }
