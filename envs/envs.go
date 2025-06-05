@@ -10,11 +10,11 @@ import (
 )
 
 type Envs struct {
-    RedigoPort            string           `env:"REDIGO_PORT" envDefault:"6379"`
-    AutosaveInterval      time.Duration `env:"AUTOSAVE_INTERVAL" envDefault:"5m"`
-    AofCompactionInterval time.Duration `env:"AOF_COMPACTION_INTERVAL" envDefault:"10m"`  
-    MaxSnapshots          int           `env:"MAX_SNAPSHOTS" envDefault:"5"`
-    DataDirectory         string        `env:"DATA_DIRECTORY"`
+    RedigoPort            string        `env:"REDIGO_PORT" envDefault:"6379"`
+    SnapshotSaveInterval  time.Duration `env:"SNAPSHOT_SAVE_INTERVAL" envDefault:"5m"`
+    FlushBufferInterval   time.Duration `env:"FLUSH_BUFFER_INTERVAL" envDefault:"10m"`
+    DataExpirationInterval time.Duration `env:"DATA_EXPIRATION_INTERVAL" envDefault:"1m"` 
+    RedigoRootDirPath     string        `env:"REDIGO_ROOT_DIR_PATH" envDefault:""`
 }
 
 func LoadEnv() {
