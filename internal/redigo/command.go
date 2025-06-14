@@ -65,6 +65,15 @@ func (database *RedigoDB) Get(key string) (types.RedigoStorableValues, error) {
     if expireTime, exists := database.expirationKeys[key]; exists && time.Now().Unix() > expireTime {
         delete(database.store, key)
         delete(database.expirationKeys, key)
+        
+        command := types.Command{
+            Name:      "DELETE",
+            Key:       key,
+            Value:     types.CommandValue{},
+            Timestamp: time.Now().Unix(),
+        }
+        database.AddCommandsToAofBuffer(command)
+        
         return nil, errors.ErrorKeyExpired
     }
     
@@ -73,4 +82,28 @@ func (database *RedigoDB) Get(key string) (types.RedigoStorableValues, error) {
         return nil, errors.ErrorKeyNotFound
     }
     return val, nil
+}
+
+func (database *RedigoDB) Delete(key string) bool {
+    database.storeMutex.Lock()
+    defer database.storeMutex.Unlock()
+    
+    _, exists := database.store[key]
+    if !exists {
+        return false
+    }
+    
+    delete(database.store, key)
+    delete(database.expirationKeys, key)
+    
+    command := types.Command{
+        Name:      "DELETE",
+        Key:       key,
+        Value:     types.CommandValue{},
+        Timestamp: time.Now().Unix(),
+    }
+    
+    database.AddCommandsToAofBuffer(command)
+    
+    return true
 }

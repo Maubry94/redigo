@@ -14,6 +14,7 @@ type Envs struct {
     SnapshotSaveInterval  time.Duration `env:"SNAPSHOT_SAVE_INTERVAL" envDefault:"5m"`
     FlushBufferInterval   time.Duration `env:"FLUSH_BUFFER_INTERVAL" envDefault:"10m"`
     DataExpirationInterval time.Duration `env:"DATA_EXPIRATION_INTERVAL" envDefault:"1m"` 
+    DefaultTTL            int64         `env:"DEFAULT_TTL" envDefault:"0"`  // 0 = pas d'expiration par défaut
     RedigoRootDirPath     string        `env:"REDIGO_ROOT_DIR_PATH" envDefault:""`
 }
 

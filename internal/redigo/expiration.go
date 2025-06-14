@@ -81,5 +81,15 @@ func (database *RedigoDB) StartDataExpirationListener() {
             delete(database.expirationKeys, key)
         }
         database.storeMutex.Unlock()
+        
+        for _, key := range expiredKeys {
+            command := types.Command{
+                Name:      "DELETE",
+                Key:       key,
+                Value:     types.CommandValue{},
+                Timestamp: now,
+            }
+            database.AddCommandsToAofBuffer(command)
+        }
     }
 }

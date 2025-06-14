@@ -24,9 +24,16 @@ func (db *RedigoDB) UpdateSnapshot() error {
     db.storeMutex.Lock()
     defer db.storeMutex.Unlock()
     
+    now := time.Now().Unix()
     snapshot := make(map[string]map[string]any)
     
     for key, value := range db.store {
+        if expireTime, exists := db.expirationKeys[key]; exists && now > expireTime {
+            delete(db.store, key)
+            delete(db.expirationKeys, key)
+            continue
+        }
+        
         var valueType string
         var rawValue any
         

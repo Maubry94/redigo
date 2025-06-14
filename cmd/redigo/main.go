@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 
@@ -14,6 +15,7 @@ import (
 const (
     SET_COMMAND    = "SET"
     GET_COMMAND    = "GET"
+    DELETE_COMMAND = "DELETE"
     TTL_COMMAND    = "TTL"
     EXPIRE_COMMAND = "EXPIRE"
     SAVE_COMMAND   = "SAVE"
@@ -21,12 +23,20 @@ const (
 )
 
 func writeResponse(conn net.Conn, msg string) {
-    conn.Write([]byte(msg))
+    if conn != nil {
+        conn.Write([]byte(msg))
+    } else {
+        fmt.Print(msg)
+    }
 }
 
 func writeError(conn net.Conn, err error) {
     if err != nil {
-        conn.Write([]byte(fmt.Sprintf("Error: %v\n", err)))
+        if conn != nil {
+            conn.Write([]byte(fmt.Sprintf("Error: %v\n", err)))
+        } else {
+            fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+        }
     }
 }
 
@@ -65,6 +75,9 @@ func HandleConnection(connection net.Conn, store *redigo.RedigoDB) {
                         writeResponse(connection, fmt.Sprintf("Invalid TTL value: %v\n", err))
                         return
                     }
+                } else {
+                    config := envs.Gets()
+                    ttl = config.DefaultTTL
                 }
                 err := store.Set(args[1], types.RedigoString(args[2]), ttl)
                 if err != nil {
@@ -82,6 +95,17 @@ func HandleConnection(connection net.Conn, store *redigo.RedigoDB) {
                     writeError(connection, err)
                 } else {
                     writeResponse(connection, fmt.Sprintf("%v\n", value))
+                }
+            case DELETE_COMMAND:
+                if len(args) != 2 {
+                    writeResponse(connection, "Usage: DELETE {key}\n")
+                    return
+                }
+                success := store.Delete(args[1])
+                if success {
+                    writeResponse(connection, "Deleted\n")
+                } else {
+                    writeResponse(connection, "Error while deleting\n")
                 }
             case TTL_COMMAND:
                 if len(args) != 2 {
