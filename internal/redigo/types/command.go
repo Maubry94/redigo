@@ -10,7 +10,7 @@ const (
 
 type CommandValue struct {
     Type  string      `json:"type"`
-    Value interface{} `json:"value"`
+    Value any `json:"value"`
 }
 
 type Command struct {

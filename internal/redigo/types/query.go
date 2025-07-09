@@ -7,7 +7,7 @@ import (
 )
 
 type RedigoQuery interface {
-	Match(key string, value RedigoStorableValues) bool
+	Match(key string, value any) bool
 }
 
 type PrefixQuery struct {
@@ -15,34 +15,33 @@ type PrefixQuery struct {
 }
 
 type ContainsValueQuery struct {
-	Substring RedigoStorableValues
+	Substring any
 }
 
 type AndQuery struct {
 	Queries []RedigoQuery
 }
 
-func (q PrefixQuery) Match(key string, _ RedigoStorableValues) bool {
+func (q PrefixQuery) Match(key string, _ any) bool {
 	return strings.HasPrefix(key, q.Prefix)
 }
 
-func (q ContainsValueQuery) Match(_ string, value RedigoStorableValues) bool {
+func (q ContainsValueQuery) Match(_ string, value any) bool {
 	switch v := value.(type) {
-	case RedigoString:
-		if subStr, ok := q.Substring.(RedigoString); ok {
-			return strings.Contains(string(v), string(subStr))
+	case string:
+		if subStr, ok := q.Substring.(string); ok {
+			return strings.Contains(v, subStr)
 		}
 		return false
-	case RedigoBool:
-		return v == q.Substring
-	case RedigoInt:
+	case bool, int, int64, float64:
 		return v == q.Substring
 	default:
-		return false
+		// Pour les autres types, on tente une comparaison directe
+		return v == q.Substring
 	}
 }
 
-func (q AndQuery) Match(key string, value RedigoStorableValues) bool {
+func (q AndQuery) Match(key string, value any) bool {
 	return lo.EveryBy(q.Queries, func(subQuery RedigoQuery) bool {
         return subQuery.Match(key, value)
     })

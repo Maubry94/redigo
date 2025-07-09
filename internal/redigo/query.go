@@ -19,7 +19,7 @@ func ParseRedigoQuery(parts []string) types.RedigoQuery {
 		case "CONTAINS":
 			// Create a contains query if next part exists
 			if i+1 < len(parts) {
-				queries = append(queries, types.ContainsValueQuery{Substring: types.RedigoString(parts[i+1])})
+				queries = append(queries, types.ContainsValueQuery{Substring: parts[i+1]})
 				i++ // Skip the next part as it's the substring value
 			}
 		}
@@ -34,12 +34,12 @@ func ParseRedigoQuery(parts []string) types.RedigoQuery {
 
 // Executes a query against the database and returns matching key-value pairs
 // This method is thread-safe and scans the entire database
-func (database *RedigoDB) GetByQuery(query types.RedigoQuery) map[string]types.RedigoStorableValues {
+func (database *RedigoDB) GetByQuery(query types.RedigoQuery) map[string]any {
 	database.storeMutex.Lock()
 	defer database.storeMutex.Unlock()
 
 	// Initialize result map to store matching entries
-	queryResult := make(map[string]types.RedigoStorableValues)
+	queryResult := make(map[string]any)
 
 	// Iterate through all key-value pairs in the database
 	for key, value := range database.store {

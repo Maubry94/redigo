@@ -9,7 +9,7 @@ const (
 )
 
 type IndexEntry struct {
-    Keys []string `json:"keys"`
+    Keys map[string]bool `json:"keys"`
 }
 
 type ReverseIndex struct {

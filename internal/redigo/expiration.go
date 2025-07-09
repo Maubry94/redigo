@@ -27,8 +27,7 @@ func (database *RedigoDB) GetTtl(key string) (int64, bool) {
 
 	// If key has expired, clean it up immediately
 	if remainingTime <= 0 {
-		delete(database.store, key)
-		delete(database.expirationKeys, key)
+		database.SafeRemoveKey(key)
 		return -1, false // Key has expired and been removed
 	}
 
@@ -54,6 +53,11 @@ func (database *RedigoDB) SetExpiry(key string, seconds int64) bool {
 		// Remove expiration (make key permanent)
 		delete(database.expirationKeys, key)
 	}
+
+	if seconds < 0 {
+		return false // Invalid expiration
+	}
+
 	// Note: negative seconds are ignored (no action taken)
 
 	// Log the EXPIRE command for persistence
@@ -70,6 +74,21 @@ func (database *RedigoDB) SetExpiry(key string, seconds int64) bool {
 	database.AddCommandsToAofBuffer(cmd)
 
 	return true
+}
+
+func (database *RedigoDB) SafeRemoveKey(key string) {
+	database.storeMutex.Lock()
+
+	delete(database.store, key)
+	delete(database.expirationKeys, key)
+
+	database.storeMutex.Unlock()
+
+}
+
+func (database *RedigoDB) UnsafeRemoveKey(key string) {
+	delete(database.store, key)
+	delete(database.expirationKeys, key)
 }
 
 // Runs a background goroutine that periodically
@@ -96,8 +115,7 @@ func (database *RedigoDB) StartDataExpirationListener() {
 
 		// Remove expired keys from both store and expiration tracking
 		for _, key := range expiredKeys {
-			delete(database.store, key)
-			delete(database.expirationKeys, key)
+			database.SafeRemoveKey(key)
 		}
 		database.storeMutex.Unlock()
 

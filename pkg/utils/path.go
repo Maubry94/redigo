@@ -12,6 +12,7 @@ var envsConfig envs.Envs
 const (
 	AOF_FILENAME         = "appendonly.aof"
 	SNAPSHOT_FILENAME    = "snapshot.redigo.json"
+	INDEXES_FILENAME    = "indexes.redigo.json"
 	REDIGO_ROOT_DIR_NAME = ".redigo"
 )
 
@@ -49,6 +50,15 @@ func GetSnapshotFilePath() (string, error) {
 	}
 
 	return filepath.Join(redigoDirFullPath, SNAPSHOT_FILENAME), nil
+}
+
+func GetIndexesFilePath() (string, error) {
+	redigoDirFullPath, err := GetRedigoFullPath()
+	if err != nil {
+		return "", err
+	}
+
+	return filepath.Join(redigoDirFullPath, INDEXES_FILENAME), nil
 }
 
 // Returns the full path to the Append Only File

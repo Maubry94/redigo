@@ -13,7 +13,7 @@ import (
 var envsConfig envs.Envs
 
 type RedigoDB struct {
-    store      map[string]types.RedigoStorableValues  // Main key-value store
+    store      map[string]any  // Main key-value store
     expirationKeys     map[string]int64                // Maps keys to their expiration timestamps
     storeMutex sync.Mutex                             // Protects concurrent access to store and expirationKeys
     aofFile    *os.File                               // Handle to the AOF for persistence
@@ -36,7 +36,7 @@ func InitializeRedigo() (*RedigoDB, error) {
 
     // Create database instance with default values
     database := &RedigoDB{
-        store:  make(map[string]types.RedigoStorableValues),
+        store:  make(map[string]any),
         expirationKeys: make(map[string]int64),
         envs:   envs,
         aofCommandsBuffer:  make([]types.Command, 0),
@@ -77,6 +77,10 @@ func InitializeRedigo() (*RedigoDB, error) {
     if err := database.LoadFromAof(); err != nil {
         return nil, fmt.Errorf("error loading AOF: %w", err)
     }
+
+    if err := database.LoadIndexesFromFile(); err != nil {
+        fmt.Printf("Failed to load indexes: %v\n", err)
+    }
     
     go database.StartSnapshotListener()
     go database.StartDataExpirationListener()
@@ -86,167 +90,168 @@ func InitializeRedigo() (*RedigoDB, error) {
 }
 
 // Adds a key-value pair to the reverse indexes
-func (db *RedigoDB) addToIndex(key string, value types.RedigoStorableValues) {
-    db.indexMutex.Lock()
-    defer db.indexMutex.Unlock()
-    
-    // Convert value to string for indexing
-    valueStr := db.valueToString(value)
-    
-    // Add to value index (exact match)
-    if entry, exists := db.valueIndex.Entries[valueStr]; exists {
-        entry.Keys = append(entry.Keys, key)
+func (database *RedigoDB) addToIndex(key string, value any) {
+    database.indexMutex.Lock()
+    defer database.indexMutex.Unlock()
+
+    valueStr := database.valueToString(value)
+
+    // --- VALUE INDEX ---
+    if entry, exists := database.valueIndex.Entries[valueStr]; exists {
+        entry.Keys[key] = true
     } else {
-        db.valueIndex.Entries[valueStr] = &types.IndexEntry{
-            Keys: []string{key},
+        database.valueIndex.Entries[valueStr] = &types.IndexEntry{
+            Keys: map[string]bool{key: true},
         }
     }
-    
-    // Add to prefix index (all prefixes of the key)
+
+    // --- PREFIX INDEX ---
     for i := 1; i <= len(key); i++ {
         prefix := key[:i]
-        if entry, exists := db.prefixIndex.Entries[prefix]; exists {
-            entry.Keys = append(entry.Keys, key)
+        if entry, exists := database.prefixIndex.Entries[prefix]; exists {
+            entry.Keys[key] = true
         } else {
-            db.prefixIndex.Entries[prefix] = &types.IndexEntry{
-                Keys: []string{key},
+            database.prefixIndex.Entries[prefix] = &types.IndexEntry{
+                Keys: map[string]bool{key: true},
             }
         }
     }
-    
-    // Add to suffix index (all suffixes of the key)
+
+    // --- SUFFIX INDEX ---
     for i := 0; i < len(key); i++ {
         suffix := key[i:]
-        if entry, exists := db.suffixIndex.Entries[suffix]; exists {
-            entry.Keys = append(entry.Keys, key)
+        if entry, exists := database.suffixIndex.Entries[suffix]; exists {
+            entry.Keys[key] = true
         } else {
-            db.suffixIndex.Entries[suffix] = &types.IndexEntry{
-                Keys: []string{key},
+            database.suffixIndex.Entries[suffix] = &types.IndexEntry{
+                Keys: map[string]bool{key: true},
             }
         }
     }
 }
 
 // Removes a key from all reverse indexes
-func (db *RedigoDB) removeFromIndex(key string, value types.RedigoStorableValues) {
-    db.indexMutex.Lock()
-    defer db.indexMutex.Unlock()
-    
-    valueStr := db.valueToString(value)
-    
-    // Remove from value index
-    if entry, exists := db.valueIndex.Entries[valueStr]; exists {
-        entry.Keys = db.removeKeyFromSlice(entry.Keys, key)
+func (database *RedigoDB) removeFromIndex(key string, value any) {
+    database.indexMutex.Lock()
+    defer database.indexMutex.Unlock()
+
+    valueStr := database.valueToString(value)
+
+    // --- VALUE INDEX ---
+    if entry, exists := database.valueIndex.Entries[valueStr]; exists {
+        delete(entry.Keys, key)
         if len(entry.Keys) == 0 {
-            delete(db.valueIndex.Entries, valueStr)
+            delete(database.valueIndex.Entries, valueStr)
         }
     }
-    
-    // Remove from prefix index
+
+    // --- PREFIX INDEX ---
     for i := 1; i <= len(key); i++ {
         prefix := key[:i]
-        if entry, exists := db.prefixIndex.Entries[prefix]; exists {
-            entry.Keys = db.removeKeyFromSlice(entry.Keys, key)
+        if entry, exists := database.prefixIndex.Entries[prefix]; exists {
+            delete(entry.Keys, key)
             if len(entry.Keys) == 0 {
-                delete(db.prefixIndex.Entries, prefix)
+                delete(database.prefixIndex.Entries, prefix)
             }
         }
     }
-    
-    // Remove from suffix index
+
+    // --- SUFFIX INDEX ---
     for i := 0; i < len(key); i++ {
         suffix := key[i:]
-        if entry, exists := db.suffixIndex.Entries[suffix]; exists {
-            entry.Keys = db.removeKeyFromSlice(entry.Keys, key)
+        if entry, exists := database.suffixIndex.Entries[suffix]; exists {
+            delete(entry.Keys, key)
             if len(entry.Keys) == 0 {
-                delete(db.suffixIndex.Entries, suffix)
+                delete(database.suffixIndex.Entries, suffix)
             }
         }
     }
 }
 
-// Converts a RedigoStorableValues to string for indexing
-func (db *RedigoDB) valueToString(value types.RedigoStorableValues) string {
+// Converts a value to string for indexing
+func (database *RedigoDB) valueToString(value any) string {
     switch v := value.(type) {
-    case types.RedigoString:
-        return string(v)
-    case types.RedigoBool:
+    case string:
+        return v
+    case bool:
         if v {
             return "true"
         }
         return "false"
-    case types.RedigoInt:
-        return fmt.Sprintf("%d", int(v))
+    case int:
+        return fmt.Sprintf("%d", v)
+    case int64:
+        return fmt.Sprintf("%d", v)
+    case float64:
+        return fmt.Sprintf("%g", v)
+    case float32:
+        return fmt.Sprintf("%g", v)
     default:
-        return ""
+        return fmt.Sprintf("%v", v)
     }
-}
-
-// Removes a key from a slice of keys
-func (db *RedigoDB) removeKeyFromSlice(keys []string, keyToRemove string) []string {
-    for i, k := range keys {
-        if k == keyToRemove {
-            return append(keys[:i], keys[i+1:]...)
-        }
-    }
-    return keys
 }
 
 // Finds all keys that have the specified value
-func (db *RedigoDB) SearchByValue(value string) []string {
-    db.indexMutex.RLock()
-    defer db.indexMutex.RUnlock()
-    
-    if entry, exists := db.valueIndex.Entries[value]; exists {
-        // Return a copy to avoid concurrent modification
-        result := make([]string, len(entry.Keys))
-        copy(result, entry.Keys)
+func (database *RedigoDB) SearchByValue(value string) []string {
+    database.indexMutex.RLock()
+    defer database.indexMutex.RUnlock()
+
+    if entry, exists := database.valueIndex.Entries[value]; exists {
+        result := make([]string, 0, len(entry.Keys))
+        for key := range entry.Keys {
+            result = append(result, key)
+        }
         return result
     }
-    return []string{}
+    return nil
 }
 
 // Finds all keys that start with the specified prefix
-func (db *RedigoDB) SearchByKeyPrefix(prefix string) []string {
-    db.indexMutex.RLock()
-    defer db.indexMutex.RUnlock()
-    
-    if entry, exists := db.prefixIndex.Entries[prefix]; exists {
-        result := make([]string, len(entry.Keys))
-        copy(result, entry.Keys)
+func (database *RedigoDB) SearchByKeyPrefix(prefix string) []string {
+    database.indexMutex.RLock()
+    defer database.indexMutex.RUnlock()
+
+    if entry, exists := database.prefixIndex.Entries[prefix]; exists {
+        result := make([]string, 0, len(entry.Keys))
+        for key := range entry.Keys {
+            result = append(result, key)
+        }
         return result
     }
-    return []string{}
+    return nil
 }
 
 // Finds all keys that end with the specified suffix
-func (db *RedigoDB) SearchByKeySuffix(suffix string) []string {
-    db.indexMutex.RLock()
-    defer db.indexMutex.RUnlock()
-    
-    if entry, exists := db.suffixIndex.Entries[suffix]; exists {
-        result := make([]string, len(entry.Keys))
-        copy(result, entry.Keys)
+func (database *RedigoDB) SearchByKeySuffix(suffix string) []string {
+    database.indexMutex.RLock()
+    defer database.indexMutex.RUnlock()
+
+    if entry, exists := database.suffixIndex.Entries[suffix]; exists {
+        result := make([]string, 0, len(entry.Keys))
+        for key := range entry.Keys {
+            result = append(result, key)
+        }
         return result
     }
-    return []string{}
+    return nil
 }
 
 // Finds all keys that contain the specified substring
-func (db *RedigoDB) SearchByKeyContains(substring string) []string {
-    db.indexMutex.RLock()
-    defer db.indexMutex.RUnlock()
+func (database *RedigoDB) SearchByKeyContains(substring string) []string {
+    database.indexMutex.RLock()
+    defer database.indexMutex.RUnlock()
     
     var result []string
     
     // Search through all keys to find those containing the substring
-    db.storeMutex.Lock()
-    for key := range db.store {
+    database.storeMutex.Lock()
+    defer database.storeMutex.Unlock()
+
+    for key := range database.store {
         if strings.Contains(key, substring) {
             result = append(result, key)
         }
     }
-    db.storeMutex.Unlock()
     
     return result
 }
