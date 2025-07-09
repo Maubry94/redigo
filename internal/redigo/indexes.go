@@ -10,9 +10,9 @@ import (
 
 func (database *RedigoDB) DumpIndexesToFile() error {
 	indexesPath, err := utils.GetIndexesFilePath()
-    if err != nil {
-        return fmt.Errorf("failed to get index file path: %w", err)
-    }
+	if err != nil {
+		return fmt.Errorf("failed to get index file path: %w", err)
+	}
 
 	database.indexMutex.RLock()
 	defer database.indexMutex.RUnlock()
@@ -24,29 +24,29 @@ func (database *RedigoDB) DumpIndexesToFile() error {
 	}
 
 	data, err := json.MarshalIndent(indexes, "", "  ")
-    if err != nil {
-        return fmt.Errorf("failed to marshal indexes: %w", err)
-    }
+	if err != nil {
+		return fmt.Errorf("failed to marshal indexes: %w", err)
+	}
 
-    if err := os.WriteFile(indexesPath, data, 0644); err != nil {
-        return fmt.Errorf("failed to write index file: %w", err)
-    }
+	if err := os.WriteFile(indexesPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write index file: %w", err)
+	}
 
 	return nil
 }
 
 func (database *RedigoDB) LoadIndexesFromFile() error {
 	indexesPath, err := utils.GetIndexesFilePath()
-    if err != nil {
-        return fmt.Errorf("failed to get index file path: %w", err)
-    }
+	if err != nil {
+		return fmt.Errorf("failed to get index file path: %w", err)
+	}
 
 	// Check if the indexes file exists
-    if _, err := os.Stat(indexesPath); os.IsNotExist(err) {
-        fmt.Println("No index file found, continuing with empty indexes")
-        return nil
-    }
-	
+	if _, err := os.Stat(indexesPath); os.IsNotExist(err) {
+		fmt.Println("No index file found, continuing with empty indexes")
+		return nil
+	}
+
 	data, err := os.ReadFile(indexesPath)
 	if err != nil {
 		return err

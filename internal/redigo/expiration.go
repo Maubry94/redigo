@@ -34,61 +34,37 @@ func (database *RedigoDB) GetTtl(key string) (int64, bool) {
 	return remainingTime, true // Return remaining seconds until expiration
 }
 
-// Sets an expiration time for an existing key
-// Returns true if expiration was set successfully, false if key doesn't exist
-func (database *RedigoDB) SetExpiry(key string, seconds int64) bool {
-	database.storeMutex.Lock()
-	defer database.storeMutex.Unlock()
-
-	// Verify key exists before setting expiration
-	_, exists := database.store[key]
-	if !exists {
-		return false
+// Handle TTL restoration for SET command
+func (database *RedigoDB) handleTtlRestoration(command types.Command) {
+	if command.Ttl == nil || *command.Ttl <= 0 {
+		return
 	}
 
-	if seconds > 0 {
-		// Set expiration time (current time + seconds)
-		database.expirationKeys[key] = time.Now().Unix() + seconds
-	} else if seconds == 0 {
-		// Remove expiration (make key permanent)
-		delete(database.expirationKeys, key)
+	now := time.Now().Unix()
+	expirationTime := command.Timestamp + *command.Ttl
+
+	if expirationTime > now {
+		// Key is still valid, restore expiration
+		database.expirationKeys[command.Key] = expirationTime
+	} else {
+		// Key has expired, remove it immediately
+		database.UnsafeRemoveKey(command.Key)
 	}
-
-	if seconds < 0 {
-		return false // Invalid expiration
-	}
-
-	// Note: negative seconds are ignored (no action taken)
-
-	// Log the EXPIRE command for persistence
-	cmd := types.Command{
-		Name:      "EXPIRE",
-		Key:       key,
-		Value:     types.CommandValue{
-			Type:  "float64",
-			Value: float64(seconds),
-		},
-		Timestamp: time.Now().Unix(),
-	}
-
-	database.AddCommandsToAofBuffer(cmd)
-
-	return true
 }
 
-func (database *RedigoDB) SafeRemoveKey(key string) {
-	database.storeMutex.Lock()
+// Apply expiration to a key considering elapsed time
+func (database *RedigoDB) applyExpiration(key string, commandTimestamp, seconds int64) {
+	now := time.Now().Unix()
+	elapsedTime := now - commandTimestamp
+	remainingTime := seconds - elapsedTime
 
-	delete(database.store, key)
-	delete(database.expirationKeys, key)
-
-	database.storeMutex.Unlock()
-
-}
-
-func (database *RedigoDB) UnsafeRemoveKey(key string) {
-	delete(database.store, key)
-	delete(database.expirationKeys, key)
+	if remainingTime > 0 {
+		// Key still has time left, set new expiration
+		database.expirationKeys[key] = now + remainingTime
+	} else {
+		// Key has expired, remove it
+		database.UnsafeRemoveKey(key)
+	}
 }
 
 // Runs a background goroutine that periodically

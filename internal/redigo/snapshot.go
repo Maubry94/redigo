@@ -34,7 +34,7 @@ func (database *RedigoDB) UpdateSnapshot() error {
 	for key, value := range database.store {
 		// Remove expired keys during snapshot creation
 		if expireTime, exists := database.expirationKeys[key]; exists && now > expireTime {
-			database.unsafeRemoveKey(key)
+			database.UnsafeRemoveKey(key)
 			continue // Skip expired keys from snapshot
 		}
 

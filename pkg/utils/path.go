@@ -12,7 +12,7 @@ var envsConfig envs.Envs
 const (
 	AOF_FILENAME         = "appendonly.aof"
 	SNAPSHOT_FILENAME    = "snapshot.redigo.json"
-	INDEXES_FILENAME    = "indexes.redigo.json"
+	INDEXES_FILENAME     = "indexes.redigo.json"
 	REDIGO_ROOT_DIR_NAME = ".redigo"
 )
 
