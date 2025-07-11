@@ -7,10 +7,17 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/samber/lo"
 )
 
+type SetTypeResolution struct {
+	valueType string
+	rawValue  any
+	found     bool
+}
+
 // Set stores a key-value pair in the database with optional TTL
-// Returns an error if the key already exists
 func (database *RedigoDB) Set(key string, value any, ttl int64) error {
 	now := time.Now().Unix()
 
@@ -24,30 +31,60 @@ func (database *RedigoDB) Set(key string, value any, ttl int64) error {
 	database.store[key] = value
 	database.addToIndex(key, value)
 
-	if ttl > 0 {
-		database.expirationKeys[key] = now + ttl
-	} else {
-		delete(database.expirationKeys, key)
+	lo.Ternary(
+		ttl > 0,
+		func() { database.expirationKeys[key] = now + ttl },
+		func() { delete(database.expirationKeys, key) },
+	)()
+
+	// Determine value type
+	valueTypeMapping := map[string]func(any) (string, any, bool){
+		"string": func(value any) (string, any, bool) {
+			if val, ok := value.(string); ok {
+				return "string", val, true
+			}
+			return "", nil, false
+		},
+		"int": func(value any) (string, any, bool) {
+			if val, ok := value.(int); ok {
+				return "int", val, true
+			}
+			return "", nil, false
+		},
+		"bool": func(value any) (string, any, bool) {
+			if val, ok := value.(bool); ok {
+				return "bool", val, true
+			}
+			return "", nil, false
+		},
+		"float64": func(value any) (string, any, bool) {
+			if val, ok := value.(float64); ok {
+				return "float64", val, true
+			}
+			return "", nil, false
+		},
 	}
 
-	// Determine the type of value for command serialization
-	var valueType string
-	var rawValue any
+	// Find the appropriate type mapper
+	typeResult := lo.Reduce(
+		lo.Keys(valueTypeMapping),
+		func(
+			acc SetTypeResolution,
+			typeKey string,
+			_ int,
+		) SetTypeResolution {
+			if acc.found {
+				return acc
+			}
+			if valueType, rawValue, ok := valueTypeMapping[typeKey](value); ok {
+				return SetTypeResolution{valueType, rawValue, true}
+			}
+			return acc
+		},
+		SetTypeResolution{"", nil, false},
+	)
 
-	switch v := value.(type) {
-	case string:
-		valueType = "string"
-		rawValue = v
-	case int:
-		valueType = "int"
-		rawValue = v
-	case bool:
-		valueType = "bool"
-		rawValue = v
-	case float64:
-		valueType = "float64"
-		rawValue = v
-	default:
+	if !typeResult.found {
 		return errors.ErrorUnsupportedValueType
 	}
 
@@ -55,8 +92,8 @@ func (database *RedigoDB) Set(key string, value any, ttl int64) error {
 		Name: "SET",
 		Key:  key,
 		Value: types.CommandValue{
-			Type:  valueType,
-			Value: rawValue,
+			Type:  typeResult.valueType,
+			Value: typeResult.rawValue,
 		},
 		Ttl:       &ttl,
 		Timestamp: now,
@@ -67,69 +104,79 @@ func (database *RedigoDB) Set(key string, value any, ttl int64) error {
 	return nil
 }
 
-// Retrieves a value by key from the database
-// Automatically removes expired keys and returns appropriate errors
+// Get retrieves a value by key from the database
 func (database *RedigoDB) Get(key string) (any, error) {
 	database.storeMutex.Lock()
 	defer database.storeMutex.Unlock()
 
-	// Check if key has expired and clean it up if so
-	if expireTime, exists := database.expirationKeys[key]; exists && time.Now().Unix() > expireTime {
+	if expireTime, exists := database.expirationKeys[key]; exists {
+		isExpired := time.Now().Unix() > expireTime
+
+		return lo.Ternary(
+			isExpired,
+			func() (any, error) {
+				database.UnsafeRemoveKey(key)
+
+				command := types.Command{
+					Name:      "DELETE",
+					Key:       key,
+					Value:     types.CommandValue{},
+					Timestamp: time.Now().Unix(),
+				}
+				database.AddCommandsToAofBuffer(command)
+
+				return nil, errors.ErrorKeyExpired
+			},
+			func() (any, error) {
+				// Key exists and is not expired, return it
+				if val, ok := database.store[key]; ok {
+					return val, nil
+				}
+				return nil, errors.ErrorKeyNotFound
+			},
+		)()
+	}
+
+	// Retrieve value from store
+	value, ok := database.store[key]
+	return lo.Ternary(
+		ok,
+		func() (any, error) {
+			return value, nil
+		},
+		func() (any, error) {
+			return nil, errors.ErrorKeyNotFound
+		},
+	)()
+}
+
+// Delete removes a key-value pair from the store
+func (database *RedigoDB) Delete(key string) bool {
+	database.storeMutex.Lock()
+	defer database.storeMutex.Unlock()
+
+	if value, exists := database.store[key]; exists {
+		// Remove from reverse indexes before deleting
+		database.removeFromIndex(key, value)
+
+		// Remove from both store and expiration tracking
 		database.UnsafeRemoveKey(key)
 
-		// Log the automatic deletion for consistency
 		command := types.Command{
 			Name:      "DELETE",
 			Key:       key,
 			Value:     types.CommandValue{},
 			Timestamp: time.Now().Unix(),
 		}
+
 		database.AddCommandsToAofBuffer(command)
-
-		return nil, errors.ErrorKeyExpired
+		return true
 	}
 
-	// Retrieve value from store
-	val, ok := database.store[key]
-	if !ok {
-		return nil, errors.ErrorKeyNotFound
-	}
-	return val, nil
+	return false
 }
 
-// Delete removes a key-value pair from the store
-// Returns true if the key was deleted, false if it didn't exist
-func (database *RedigoDB) Delete(key string) bool {
-	database.storeMutex.Lock()
-	defer database.storeMutex.Unlock()
-
-	// Check if key exists before attempting deletion
-	value, exists := database.store[key]
-	if !exists {
-		return false
-	}
-
-	// Remove from reverse indexes before deleting
-	database.removeFromIndex(key, value)
-
-	// Remove from both store and expiration tracking
-	database.UnsafeRemoveKey(key)
-
-	// Log deletion command for persistence
-	command := types.Command{
-		Name:      "DELETE",
-		Key:       key,
-		Value:     types.CommandValue{},
-		Timestamp: time.Now().Unix(),
-	}
-
-	database.AddCommandsToAofBuffer(command)
-
-	return true
-}
-
-// Sets an expiration time for an existing key
-// Returns true if expiration was set successfully, false if key doesn't exist
+// SetExpiry sets an expiration time for an existing key
 func (database *RedigoDB) SetExpiry(key string, seconds int64) bool {
 	database.storeMutex.Lock()
 	defer database.storeMutex.Unlock()
@@ -140,22 +187,47 @@ func (database *RedigoDB) SetExpiry(key string, seconds int64) bool {
 		return false
 	}
 
-	if seconds > 0 {
-		// Set expiration time (current time + seconds)
-		database.expirationKeys[key] = time.Now().Unix() + seconds
-	} else if seconds == 0 {
-		// Remove expiration (make key permanent)
-		delete(database.expirationKeys, key)
+	expirationHandlers := map[string]func(int64) bool{
+		"positive": func(s int64) bool {
+			database.expirationKeys[key] = time.Now().Unix() + s
+			return true
+		},
+		"zero": func(s int64) bool {
+			delete(database.expirationKeys, key)
+			return true
+		},
+		"negative": func(s int64) bool {
+			return false // Invalid expiration
+		},
 	}
 
-	if seconds < 0 {
-		return false // Invalid expiration
+	// Determine expiration type and apply appropriate handler
+	expirationResult := lo.Reduce(
+		[]string{"positive", "zero", "negative"},
+		func(acc bool, handlerType string, _ int) bool {
+			if acc {
+				return acc // Already processed
+			}
+
+			shouldHandle := lo.Switch[string, bool](handlerType).
+				Case("positive", seconds > 0).
+				Case("zero", seconds == 0).
+				Case("negative", seconds < 0).
+				Default(false)
+
+			if shouldHandle {
+				return expirationHandlers[handlerType](seconds)
+			}
+			return false
+		},
+		false,
+	)
+
+	if !expirationResult {
+		return false
 	}
 
-	// Note: negative seconds are ignored (no action taken)
-
-	// Log the EXPIRE command for persistence
-	cmd := types.Command{
+	command := types.Command{
 		Name: "EXPIRE",
 		Key:  key,
 		Value: types.CommandValue{
@@ -165,101 +237,122 @@ func (database *RedigoDB) SetExpiry(key string, seconds int64) bool {
 		Timestamp: time.Now().Unix(),
 	}
 
-	database.AddCommandsToAofBuffer(cmd)
-
+	database.AddCommandsToAofBuffer(command)
 	return true
 }
 
-// Finds all keys that have the specified value
+// SearchByValue finds all keys that have the specified value
 func (database *RedigoDB) SearchByValue(value string) []string {
 	database.indexMutex.RLock()
 	defer database.indexMutex.RUnlock()
 
-	if entry, exists := database.valueIndex.Entries[value]; exists {
-		result := make([]string, 0, len(entry.Keys))
-		for key := range entry.Keys {
-			result = append(result, key)
-		}
-		return result
-	}
-	return nil
+	return lo.Ternary(
+		lo.HasKey(database.valueIndex.Entries, value),
+		func() []string {
+			return lo.Keys(database.valueIndex.Entries[value].Keys)
+		},
+		func() []string {
+			return nil
+		},
+	)()
 }
 
-// Finds all keys that start with the specified prefix
+// SearchByKeyPrefix finds all keys that start with the specified prefix
 func (database *RedigoDB) SearchByKeyPrefix(prefix string) []string {
 	database.indexMutex.RLock()
 	defer database.indexMutex.RUnlock()
 
-	if entry, exists := database.prefixIndex.Entries[prefix]; exists {
-		result := make([]string, 0, len(entry.Keys))
-		for key := range entry.Keys {
-			result = append(result, key)
-		}
-		return result
-	}
-	return nil
+	return lo.Ternary(
+		lo.HasKey(database.prefixIndex.Entries, prefix),
+		func() []string {
+			return lo.Keys(database.prefixIndex.Entries[prefix].Keys)
+		},
+		func() []string {
+			return nil
+		},
+	)()
 }
 
-// Finds all keys that end with the specified suffix
+// SearchByKeySuffix finds all keys that end with the specified suffix
 func (database *RedigoDB) SearchByKeySuffix(suffix string) []string {
 	database.indexMutex.RLock()
 	defer database.indexMutex.RUnlock()
 
-	if entry, exists := database.suffixIndex.Entries[suffix]; exists {
-		result := make([]string, 0, len(entry.Keys))
-		for key := range entry.Keys {
-			result = append(result, key)
-		}
-		return result
-	}
-	return nil
+	return lo.Ternary(
+		lo.HasKey(database.suffixIndex.Entries, suffix),
+		func() []string {
+			return lo.Keys(database.suffixIndex.Entries[suffix].Keys)
+		},
+		func() []string {
+			return nil
+		},
+	)()
 }
 
-// Finds all keys that contain the specified substring
+// SearchByKeyContains finds all keys that contain the specified substring
 func (database *RedigoDB) SearchByKeyContains(substring string) []string {
 	database.indexMutex.RLock()
 	defer database.indexMutex.RUnlock()
 
-	var result []string
-
-	// Search through all keys to find those containing the substring
 	database.storeMutex.Lock()
 	defer database.storeMutex.Unlock()
 
-	for key := range database.store {
-		if strings.Contains(key, substring) {
-			result = append(result, key)
-		}
-	}
-
-	return result
+	// Use lo.Filter to find keys containing the substring
+	return lo.Filter(
+		lo.Keys(database.store),
+		func(key string, _ int) bool {
+			return strings.Contains(key, substring)
+		},
+	)
 }
 
+// DeserializeCommandValue deserializes a command value
 func DeserializeCommandValue(commandValue types.CommandValue) (any, error) {
-	switch commandValue.Type {
-	case "string":
-		if strVal, ok := commandValue.Value.(string); ok {
-			return strVal, nil
-		}
-	case "bool":
-		if boolVal, ok := commandValue.Value.(bool); ok {
-			return boolVal, nil
-		}
-	case "int":
-		switch v := commandValue.Value.(type) {
-		case float64:
-			return int(v), nil
-		case string:
-			i, err := strconv.Atoi(v)
-			if err != nil {
-				return nil, err
+	// Define type-specific deserializers
+	deserializers := map[string]func(any) (any, error){
+		"string": func(value any) (any, error) {
+			if stringValue, ok := value.(string); ok {
+				return stringValue, nil
 			}
-			return i, nil
-		}
-	case "float64":
-		if floatVal, ok := commandValue.Value.(float64); ok {
-			return floatVal, nil
-		}
+			return nil, fmt.Errorf("expected string, got %T", value)
+		},
+		"bool": func(value any) (any, error) {
+			if boolValue, ok := value.(bool); ok {
+				return boolValue, nil
+			}
+			return nil, fmt.Errorf("expected bool, got %T", value)
+		},
+		"int": func(value any) (any, error) {
+			switch v := value.(type) {
+			case float64:
+				return int(v), nil
+			case string:
+				parsedInt, err := strconv.Atoi(v)
+				if err != nil {
+					return nil, fmt.Errorf("cannot convert string to int: %w", err)
+				}
+				return parsedInt, nil
+			default:
+				return nil, fmt.Errorf("cannot convert %T to int", v)
+			}
+		},
+		"float64": func(value any) (any, error) {
+			if floatValue, ok := value.(float64); ok {
+				return floatValue, nil
+			}
+			return nil, fmt.Errorf("expected float64, got %T", value)
+		},
 	}
-	return nil, fmt.Errorf("unsupported or invalid CommandValue type: %s", commandValue.Type)
+
+	deserializer, exists := deserializers[commandValue.Type]
+	if !exists {
+		return nil, fmt.Errorf("unsupported CommandValue type: %s", commandValue.Type)
+	}
+
+	return deserializer(commandValue.Value)
+}
+
+func IsValidCommandType(commandName types.CommandName) bool {
+	validCommands := []types.CommandName{types.SET, types.DELETE, types.EXPIRE}
+	return lo.Contains(validCommands, commandName)
 }

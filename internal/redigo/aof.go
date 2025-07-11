@@ -8,10 +8,11 @@ import (
 	"redigo/internal/redigo/types"
 	"redigo/pkg/utils"
 	"strconv"
+
+	"github.com/samber/lo"
 )
 
 // Safely closes the AOF file handle
-// Returns an error if the file close operation fails
 func (database *RedigoDB) CloseAof() error {
 	if database.aofFile != nil {
 		return database.aofFile.Close()
@@ -20,8 +21,6 @@ func (database *RedigoDB) CloseAof() error {
 }
 
 // Adds a command to the AOF buffer in a thread-safe manner
-// The buffer is used to batch commands before writing them to disk
-// Returns the updated buffer slice
 func (database *RedigoDB) AddCommandsToAofBuffer(command types.Command) []types.Command {
 	database.aofCommandsBufferMutex.Lock()
 	database.aofCommandsBuffer = append(database.aofCommandsBuffer, command)
@@ -31,7 +30,6 @@ func (database *RedigoDB) AddCommandsToAofBuffer(command types.Command) []types.
 }
 
 // Reads and replays commands from the AOF file to restore database state
-// This is called during server startup to recover data from the previous session
 func (database *RedigoDB) LoadFromAof() error {
 	aofPath, err := utils.GetAOFPath()
 	if err != nil {
@@ -39,11 +37,11 @@ func (database *RedigoDB) LoadFromAof() error {
 	}
 
 	// Check if AOF file exists
-	if !database.aofFileExists(aofPath) {
+	if !utils.FileExists(aofPath) {
 		return nil // No AOF file, start with empty database
 	}
 
-	file, err := database.openAofFile(aofPath)
+	file, err := utils.OpenFile(aofPath)
 	if err != nil {
 		return err
 	}
@@ -52,63 +50,57 @@ func (database *RedigoDB) LoadFromAof() error {
 	return database.processAofCommands(file)
 }
 
-// Check if AOF file exists
-func (database *RedigoDB) aofFileExists(aofPath string) bool {
-	_, err := os.Stat(aofPath)
-	return !os.IsNotExist(err)
-}
+func (database *RedigoDB) processAofCommands(aofFile *os.File) error {
+	scanner := bufio.NewScanner(aofFile)
+	lines := []string{}
 
-// Open AOF file for reading
-func (database *RedigoDB) openAofFile(aofPath string) (*os.File, error) {
-	file, err := os.Open(aofPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open AOF file: %w", err)
-	}
-	return file, nil
-}
-
-// Process all commands from AOF file
-func (database *RedigoDB) processAofCommands(file *os.File) error {
-	scanner := bufio.NewScanner(file)
-	lineNumber := 0
-
+	// Collect all lines first
 	for scanner.Scan() {
-		lineNumber++
-		if err := database.processAofLine(scanner.Text()); err != nil {
-			// Log error but continue processing
-			fmt.Printf("Error processing AOF line %d: %v\n", lineNumber, err)
-		}
+		lines = append(lines, scanner.Text())
 	}
 
-	return scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+
+	lo.ForEach(
+		lines,
+		func(line string, index int) {
+			if err := database.processAofLine(line); err != nil {
+				fmt.Printf("Error processing AOF line %d: %v\n", index+1, err)
+			}
+		},
+	)
+
+	return nil
 }
 
 // Process a single line from AOF file
-func (database *RedigoDB) processAofLine(line string) error {
+func (database *RedigoDB) processAofLine(aofLine string) error {
 	var command types.Command
-	if err := json.Unmarshal([]byte(line), &command); err != nil {
-		return fmt.Errorf("failed to parse JSON: %w", err)
+	if err := json.Unmarshal([]byte(aofLine), &command); err != nil {
+		return fmt.Errorf("failed to parse aof line: %w", err)
 	}
 
-	return database.replayCommand(command)
+	return database.handleCommand(command)
 }
 
-// Replay a single command based on its type
-func (database *RedigoDB) replayCommand(command types.Command) error {
-	switch command.Name {
-	case types.SET:
-		return database.replaySetCommand(command)
-	case types.DELETE:
-		return database.replayDeleteCommand(command)
-	case types.EXPIRE:
-		return database.replayExpireCommand(command)
-	default:
+func (database *RedigoDB) handleCommand(command types.Command) error {
+	if !IsValidCommandType(command.Name) {
 		return fmt.Errorf("unknown command type: %s", command.Name)
 	}
+
+	handlers := map[types.CommandName]func(types.Command) error{
+		types.SET:    database.handleSetCommand,
+		types.DELETE: database.handleDeleteCommand,
+		types.EXPIRE: database.handleExpireCommand,
+	}
+
+	handler := handlers[command.Name]
+	return handler(command)
 }
 
-// Replay SET command
-func (database *RedigoDB) replaySetCommand(command types.Command) error {
+func (database *RedigoDB) handleSetCommand(command types.Command) error {
 	value, err := DeserializeCommandValue(command.Value)
 	if err != nil {
 		return fmt.Errorf("failed to deserialize value: %w", err)
@@ -127,14 +119,12 @@ func (database *RedigoDB) replaySetCommand(command types.Command) error {
 	return nil
 }
 
-// Replay DELETE command
-func (database *RedigoDB) replayDeleteCommand(command types.Command) error {
+func (database *RedigoDB) handleDeleteCommand(command types.Command) error {
 	database.SafeRemoveKey(command.Key)
 	return nil
 }
 
-// Replay EXPIRE command
-func (database *RedigoDB) replayExpireCommand(command types.Command) error {
+func (database *RedigoDB) handleExpireCommand(command types.Command) error {
 	seconds, err := database.parseExpirationSeconds(command.Value)
 	if err != nil {
 		return fmt.Errorf("failed to parse expiration seconds: %w", err)
@@ -144,25 +134,40 @@ func (database *RedigoDB) replayExpireCommand(command types.Command) error {
 	defer database.storeMutex.Unlock()
 
 	if _, exists := database.store[command.Key]; !exists {
-		return nil // Key doesn't exist, nothing to do
+		return nil // Key doesn't exist
 	}
 
 	database.applyExpiration(command.Key, command.Timestamp, seconds)
 	return nil
 }
 
-// Parse expiration seconds from command value
 func (database *RedigoDB) parseExpirationSeconds(value types.CommandValue) (int64, error) {
-	switch v := value.Value.(type) {
-	case float64:
-		return int64(v), nil
-	case string:
-		seconds, err := strconv.ParseInt(v, 10, 64)
-		if err != nil {
-			return 0, fmt.Errorf("invalid string format: %w", err)
-		}
-		return seconds, nil
-	default:
-		return 0, fmt.Errorf("unsupported value type: %T", v)
+	// Define parsing strategies as a map
+	parsers := map[string]func(any) (int64, error){
+		"float64": func(value any) (int64, error) {
+			if val, ok := value.(float64); ok {
+				return int64(val), nil
+			}
+			return 0, fmt.Errorf("expected float64, got %T", value)
+		},
+		"string": func(value any) (int64, error) {
+			if val, ok := value.(string); ok {
+				seconds, err := strconv.ParseInt(val, 10, 64)
+				if err != nil {
+					return 0, fmt.Errorf("invalid string format: %w", err)
+				}
+				return seconds, nil
+			}
+			return 0, fmt.Errorf("expected string, got %T", value)
+		},
 	}
+
+	typeName := fmt.Sprintf("%T", value.Value)
+	parser, exists := parsers[typeName]
+
+	if !exists {
+		return 0, fmt.Errorf("unsupported value type: %T", value.Value)
+	}
+
+	return parser(value.Value)
 }

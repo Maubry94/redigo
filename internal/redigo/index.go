@@ -7,7 +7,10 @@ import (
 	"redigo/internal/redigo/types"
 	"redigo/pkg/utils"
 	"sync"
+
+	"github.com/samber/lo"
 )
+
 
 var envsConfig envs.Envs
 
@@ -29,164 +32,265 @@ type RedigoDB struct {
 }
 
 // Creates and initializes a new RedigoDB instance
-// It loads configuration, restores data from snapshot and AOF, and starts background processes
 func InitializeRedigo() (*RedigoDB, error) {
 	envs := envs.Gets()
 
-	// Create database instance with default values
 	database := &RedigoDB{
 		store:             make(map[string]any),
 		expirationKeys:    make(map[string]int64),
 		envs:              envs,
 		aofCommandsBuffer: make([]types.Command, 0),
+	}
 
-		// Initialize reverse indexes
-		valueIndex: &types.ReverseIndex{
-			Type:    types.VALUE_INDEX,
-			Entries: make(map[string]*types.IndexEntry),
+	indexTypes := []types.IndexType{
+		types.VALUE_INDEX,
+		types.PREFIX_INDEX,
+		types.SUFFIX_INDEX,
+	}
+	indexes := lo.Map(
+		indexTypes,
+		func(indexType types.IndexType, _ int) *types.ReverseIndex {
+			return &types.ReverseIndex{
+				Type:    indexType,
+				Entries: make(map[string]*types.IndexEntry),
+			}
+		})
+
+	database.valueIndex = indexes[0]
+	database.prefixIndex = indexes[1]
+	database.suffixIndex = indexes[2]
+
+	// Define initialization steps with their error handling
+	initSteps := []types.InitializationStep{
+		{
+			Name: "snapshot",
+			Function: database.LoadFromSnapshot,
 		},
-		prefixIndex: &types.ReverseIndex{
-			Type:    types.PREFIX_INDEX,
-			Entries: make(map[string]*types.IndexEntry),
+		{
+			Name: "aof_setup",
+			Function: func() error {
+				aofPath, err := utils.GetAOFPath()
+				if err != nil {
+					return err
+				}
+
+				loadedAOF, err := os.OpenFile(aofPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+				if err != nil {
+					return err
+				}
+
+				database.aofFile = loadedAOF
+				return nil
+			},
 		},
-		suffixIndex: &types.ReverseIndex{
-			Type:    types.SUFFIX_INDEX,
-			Entries: make(map[string]*types.IndexEntry),
+		{
+			Name: "aof_load",
+			Function: database.LoadFromAof,
+		},
+		{
+			Name: "indexes_load",
+			Function: func() error {
+				if err := database.LoadIndexesFromFile(); err != nil {
+					fmt.Printf("Failed to load indexes: %v\n", err)
+					// Non-critical error, continue
+				}
+				return nil
+			},
 		},
 	}
 
-	if err := database.LoadFromSnapshot(); err != nil {
-		return nil, fmt.Errorf("error loading snapshot: %w", err)
+	for _, step := range initSteps {
+		if err := step.Function(); err != nil {
+			return nil, fmt.Errorf("error during %s initialization: %w", step.Name, err)
+		}
 	}
 
-	aofPath, err := utils.GetAOFPath()
-
-	if err != nil {
-		return nil, err
+	backgroundProcesses := []func(){
+		database.StartSnapshotListener,
+		database.StartDataExpirationListener,
+		database.StartBufferListener,
 	}
 
-	loadedAOF, err := os.OpenFile(aofPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-
-	if err != nil {
-		return nil, err
-	}
-
-	database.aofFile = loadedAOF
-
-	if err := database.LoadFromAof(); err != nil {
-		return nil, fmt.Errorf("error loading AOF: %w", err)
-	}
-
-	if err := database.LoadIndexesFromFile(); err != nil {
-		fmt.Printf("Failed to load indexes: %v\n", err)
-	}
-
-	go database.StartSnapshotListener()
-	go database.StartDataExpirationListener()
-	go database.StartBufferListener()
+	lo.ForEach(
+		backgroundProcesses,
+		func(process func(), _ int) {
+			go process()
+		},
+	)
 
 	return database, nil
 }
 
-// Adds a key-value pair to the reverse indexes
+// Adds a key-value pair to the reverse indexes using functional approach
 func (database *RedigoDB) addToIndex(key string, value any) {
 	database.indexMutex.Lock()
 	defer database.indexMutex.Unlock()
 
 	valueStr := utils.ValueToString(value)
 
-	// --- VALUE INDEX ---
-	if entry, exists := database.valueIndex.Entries[valueStr]; exists {
-		entry.Keys[key] = true
-	} else {
-		database.valueIndex.Entries[valueStr] = &types.IndexEntry{
-			Keys: map[string]bool{key: true},
-		}
+	// Define index operations functionally
+	indexOperations := []types.IndexOperation{
+		{
+			Name:  "value",
+			Index: database.valueIndex,
+			GetKeys: func(k string) []string {
+				return []string{valueStr}
+			},
+		},
+		{
+			Name:  "prefix",
+			Index: database.prefixIndex,
+			GetKeys: func(k string) []string {
+				return lo.Map(
+					lo.Range(len(k)),
+					func(i int, _ int) string {
+						return k[:i+1]
+					},
+				)
+			},
+		},
+		{
+			Name:  "suffix",
+			Index: database.suffixIndex,
+			GetKeys: func(k string) []string {
+				return lo.Map(lo.Range(len(k)), func(i int, _ int) string {
+					return k[i:]
+				})
+			},
+		},
 	}
 
-	// --- PREFIX INDEX ---
-	for i := 1; i <= len(key); i++ {
-		prefix := key[:i]
-		if entry, exists := database.prefixIndex.Entries[prefix]; exists {
-			entry.Keys[key] = true
-		} else {
-			database.prefixIndex.Entries[prefix] = &types.IndexEntry{
-				Keys: map[string]bool{key: true},
-			}
-		}
-	}
+	lo.ForEach(
+		indexOperations,
+		func(operation types.IndexOperation, _ int) {
+			keys := operation.GetKeys(key)
 
-	// --- SUFFIX INDEX ---
-	for i := 0; i < len(key); i++ {
-		suffix := key[i:]
-		if entry, exists := database.suffixIndex.Entries[suffix]; exists {
-			entry.Keys[key] = true
-		} else {
-			database.suffixIndex.Entries[suffix] = &types.IndexEntry{
-				Keys: map[string]bool{key: true},
-			}
-		}
-	}
+			lo.ForEach(
+				keys,
+				func(indexKey string, _ int) {
+					lo.Ternary(
+						lo.HasKey(operation.Index.Entries, indexKey),
+						func() {
+							operation.Index.Entries[indexKey].Keys[key] = true
+						},
+						func() {
+							operation.Index.Entries[indexKey] = &types.IndexEntry{
+								Keys: map[string]bool{key: true},
+							}
+						},
+					)()
+				},
+			)
+		},
+	)
 }
 
-// Removes a key from all reverse indexes
+// Removes a key from all reverse indexes using functional approach
 func (database *RedigoDB) removeFromIndex(key string, value any) {
 	database.indexMutex.Lock()
 	defer database.indexMutex.Unlock()
 
 	valueStr := utils.ValueToString(value)
 
-	// --- VALUE INDEX ---
-	if entry, exists := database.valueIndex.Entries[valueStr]; exists {
-		delete(entry.Keys, key)
-		if len(entry.Keys) == 0 {
-			delete(database.valueIndex.Entries, valueStr)
-		}
+	// Define index removal operations functionally
+	indexRemovalOps := []types.IndexOperation{
+		{
+			Name:  "value",
+			Index: database.valueIndex,
+			GetKeys: func(k string) []string {
+				return []string{valueStr}
+			},
+		},
+		{
+			Name:  "prefix",
+			Index: database.prefixIndex,
+			GetKeys: func(k string) []string {
+				return lo.Map(lo.Range(len(k)), func(i int, _ int) string {
+					return k[:i+1]
+				})
+			},
+		},
+		{
+			Name:  "suffix",
+			Index: database.suffixIndex,
+			GetKeys: func(k string) []string {
+				return lo.Map(lo.Range(len(k)), func(i int, _ int) string {
+					return k[i:]
+				})
+			},
+		},
 	}
 
-	// --- PREFIX INDEX ---
-	for i := 1; i <= len(key); i++ {
-		prefix := key[:i]
-		if entry, exists := database.prefixIndex.Entries[prefix]; exists {
-			delete(entry.Keys, key)
-			if len(entry.Keys) == 0 {
-				delete(database.prefixIndex.Entries, prefix)
-			}
-		}
-	}
+	lo.ForEach(
+		indexRemovalOps,
+		func(operation types.IndexOperation, _ int) {
+			keys := operation.GetKeys(key)
 
-	// --- SUFFIX INDEX ---
-	for i := 0; i < len(key); i++ {
-		suffix := key[i:]
-		if entry, exists := database.suffixIndex.Entries[suffix]; exists {
-			delete(entry.Keys, key)
-			if len(entry.Keys) == 0 {
-				delete(database.suffixIndex.Entries, suffix)
-			}
-		}
-	}
+			lo.ForEach(
+				keys,
+				func(indexKey string, _ int) {
+					if entry, exists := operation.Index.Entries[indexKey]; exists {
+						delete(entry.Keys, key)
+
+						// Remove entry if no keys left
+						lo.Ternary(
+							len(entry.Keys) == 0,
+							func() { delete(operation.Index.Entries, indexKey) },
+							func() { /* keep entry */ },
+						)()
+					}
+				},
+			)
+		},
+	)
 }
 
+// SafeRemoveKey removes a key from store and expiration keys with mutex protection
 func (database *RedigoDB) SafeRemoveKey(key string) {
 	database.storeMutex.Lock()
+	defer database.storeMutex.Unlock()
 
-	delete(database.store, key)
-	delete(database.expirationKeys, key)
-
-	database.storeMutex.Unlock()
-
-}
-
-func (database *RedigoDB) UnsafeRemoveKey(key string) {
-	delete(database.store, key)
-	delete(database.expirationKeys, key)
-}
-
-// Forces the database to save its state to a snapshot file
-func (database *RedigoDB) ForceSave() error {
-	if err := database.UpdateSnapshot(); err != nil {
-		return fmt.Errorf("Error creating snapshot: %w", err)
+	cleanupActions := []func(){
+		func() { delete(database.store, key) },
+		func() { delete(database.expirationKeys, key) },
 	}
 
-	return nil
+	lo.ForEach(
+		cleanupActions,
+		func(action func(), _ int) {
+			action()
+		},
+	)
+}
+
+// UnsafeRemoveKey removes a key from store and expiration keys without mutex protection
+func (database *RedigoDB) UnsafeRemoveKey(key string) {
+	// Use functional approach to remove from multiple maps
+	cleanupActions := []func(){
+		func() { delete(database.store, key) },
+		func() { delete(database.expirationKeys, key) },
+	}
+
+	lo.ForEach(
+		cleanupActions,
+		func(action func(), _ int) {
+			action()
+		},
+	)
+}
+
+// ForceSave forces the database to save its state to a snapshot file using functional approach
+func (database *RedigoDB) ForceSave() error {
+	// Use functional error handling with lo.Ternary
+	return lo.Ternary(
+		func() error {
+			return database.UpdateSnapshot()
+		}() != nil,
+		func() error {
+			return fmt.Errorf("Error creating snapshot: %w", database.UpdateSnapshot())
+		},
+		func() error {
+			return nil
+		},
+	)()
 }

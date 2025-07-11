@@ -6,7 +6,14 @@ import (
 	"os"
 	"redigo/internal/redigo/types"
 	"redigo/pkg/utils"
+
+	"github.com/samber/lo"
 )
+
+type IndexMapping struct {
+	Key   string
+	Field **types.ReverseIndex
+}
 
 func (database *RedigoDB) DumpIndexesToFile() error {
 	indexesPath, err := utils.GetIndexesFilePath()
@@ -17,11 +24,22 @@ func (database *RedigoDB) DumpIndexesToFile() error {
 	database.indexMutex.RLock()
 	defer database.indexMutex.RUnlock()
 
-	indexes := map[string]*types.ReverseIndex{
-		"value":  database.valueIndex,
-		"prefix": database.prefixIndex,
-		"suffix": database.suffixIndex,
+	indexEntries := []lo.Entry[string, *types.ReverseIndex]{
+		{
+			Key:   "value",
+			Value: database.valueIndex,
+		},
+		{
+			Key:   "prefix",
+			Value: database.prefixIndex,
+		},
+		{
+			Key:   "suffix",
+			Value: database.suffixIndex,
+		},
 	}
+
+	indexes := lo.FromEntries(indexEntries)
 
 	data, err := json.MarshalIndent(indexes, "", "  ")
 	if err != nil {
@@ -60,21 +78,40 @@ func (database *RedigoDB) LoadIndexesFromFile() error {
 	database.indexMutex.Lock()
 	defer database.indexMutex.Unlock()
 
-	// Recharge les index dans l’objet
-	if value, ok := indexes["value"]; ok {
-		database.valueIndex = value
-	}
-	if prefix, ok := indexes["prefix"]; ok {
-		database.prefixIndex = prefix
-	}
-	if suffix, ok := indexes["suffix"]; ok {
-		database.suffixIndex = suffix
+	indexMappings := []IndexMapping{
+		{
+			"value",
+			&database.valueIndex,
+		},
+		{
+			"prefix",
+			&database.prefixIndex,
+		},
+		{
+			"suffix",
+			&database.suffixIndex,
+		},
 	}
 
-	fmt.Printf("Loaded %d value indexes, %d prefix indexes, %d suffix indexes\n",
-		len(database.valueIndex.Entries),
-		len(database.prefixIndex.Entries),
-		len(database.suffixIndex.Entries),
+	lo.ForEach(
+		indexMappings,
+		func(mapping IndexMapping, _ int) {
+			if index, exists := indexes[mapping.Key]; exists {
+				*mapping.Field = index
+			}
+		},
+	)
+
+	counts := lo.Map(
+		indexMappings,
+		func(mapping IndexMapping, _ int) int {
+			return len((*mapping.Field).Entries)
+		},
+	)
+
+	fmt.Printf(
+		"Loaded %d value indexes, %d prefix indexes, %d suffix indexes\n",
+		counts[0], counts[1], counts[2],
 	)
 
 	return nil
