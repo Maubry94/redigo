@@ -12,7 +12,6 @@ import (
 	"github.com/samber/lo"
 )
 
-// Safely closes the AOF file handle
 func (database *RedigoDB) CloseAof() error {
 	if database.aofFile != nil {
 		return database.aofFile.Close()
@@ -20,7 +19,6 @@ func (database *RedigoDB) CloseAof() error {
 	return nil
 }
 
-// Adds a command to the AOF buffer in a thread-safe manner
 func (database *RedigoDB) AddCommandsToAofBuffer(command types.Command) []types.Command {
 	database.aofCommandsBufferMutex.Lock()
 	database.aofCommandsBuffer = append(database.aofCommandsBuffer, command)
@@ -29,16 +27,14 @@ func (database *RedigoDB) AddCommandsToAofBuffer(command types.Command) []types.
 	return database.aofCommandsBuffer
 }
 
-// Reads and replays commands from the AOF file to restore database state
 func (database *RedigoDB) LoadFromAof() error {
 	aofPath, err := utils.GetAOFPath()
 	if err != nil {
 		return fmt.Errorf("failed to get AOF path: %w", err)
 	}
 
-	// Check if AOF file exists
 	if !utils.FileExists(aofPath) {
-		return nil // No AOF file, start with empty database
+		return nil
 	}
 
 	file, err := utils.OpenFile(aofPath)
@@ -54,7 +50,6 @@ func (database *RedigoDB) processAofCommands(aofFile *os.File) error {
 	scanner := bufio.NewScanner(aofFile)
 	lines := []string{}
 
-	// Collect all lines first
 	for scanner.Scan() {
 		lines = append(lines, scanner.Text())
 	}
@@ -75,7 +70,6 @@ func (database *RedigoDB) processAofCommands(aofFile *os.File) error {
 	return nil
 }
 
-// Process a single line from AOF file
 func (database *RedigoDB) processAofLine(aofLine string) error {
 	var command types.Command
 	if err := json.Unmarshal([]byte(aofLine), &command); err != nil {
@@ -134,7 +128,7 @@ func (database *RedigoDB) handleExpireCommand(command types.Command) error {
 	defer database.storeMutex.Unlock()
 
 	if _, exists := database.store[command.Key]; !exists {
-		return nil // Key doesn't exist
+		return nil
 	}
 
 	database.applyExpiration(command.Key, command.Timestamp, seconds)
@@ -142,7 +136,6 @@ func (database *RedigoDB) handleExpireCommand(command types.Command) error {
 }
 
 func (database *RedigoDB) parseExpirationSeconds(value types.CommandValue) (int64, error) {
-	// Define parsing strategies as a map
 	parsers := map[string]func(any) (int64, error){
 		"float64": func(value any) (int64, error) {
 			if val, ok := value.(float64); ok {

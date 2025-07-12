@@ -16,12 +16,9 @@ const (
 	REDIGO_ROOT_DIR_NAME = ".redigo"
 )
 
-// Returns the full path to Redigo's data directory
-// Creates the directory if it doesn't exist
 func GetRedigoFullPath() (string, error) {
 	rootDirPath := envsConfig.RedigoRootDirPath
 
-	// Use user's home directory if no custom path is configured
 	if rootDirPath == "" {
 		userHomeDir, err := os.UserHomeDir()
 		if err != nil {
@@ -30,10 +27,8 @@ func GetRedigoFullPath() (string, error) {
 		rootDirPath = userHomeDir
 	}
 
-	// Create full path by joining root directory with Redigo folder name
 	redigoFullDirPath := filepath.Join(rootDirPath, REDIGO_ROOT_DIR_NAME)
 
-	// Create directory with proper permissions if it doesn't exist
 	if err := os.MkdirAll(redigoFullDirPath, 0755); err != nil {
 		return "", err
 	}
@@ -41,8 +36,6 @@ func GetRedigoFullPath() (string, error) {
 	return redigoFullDirPath, nil
 }
 
-// Returns the full path to the snapshot file
-// Used for database state persistence
 func GetSnapshotFilePath() (string, error) {
 	redigoDirFullPath, err := GetRedigoFullPath()
 	if err != nil {
@@ -61,8 +54,6 @@ func GetIndexesFilePath() (string, error) {
 	return filepath.Join(redigoDirFullPath, INDEXES_FILENAME), nil
 }
 
-// Returns the full path to the Append Only File
-// Used for command logging and replay functionality
 func GetAOFPath() (string, error) {
 	redigoDirFullPath, err := GetRedigoFullPath()
 	if err != nil {

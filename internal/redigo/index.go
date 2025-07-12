@@ -24,14 +24,12 @@ type RedigoDB struct {
 	aofCommandsBuffer      []types.Command  // Buffer for AOF commands before flushing to disk
 	aofCommandsBufferMutex sync.Mutex       // Protects concurrent access to the AOF buffer
 
-	// Reverse indexes for efficient value-based searching
 	valueIndex  *types.ReverseIndex // Index for searching by exact value
 	prefixIndex *types.ReverseIndex // Index for searching by key prefix
 	suffixIndex *types.ReverseIndex // Index for searching by key suffix
 	indexMutex  sync.RWMutex        // Protects concurrent access to indexes
 }
 
-// Creates and initializes a new RedigoDB instance
 func InitializeRedigo() (*RedigoDB, error) {
 	envs := envs.Gets()
 
@@ -60,7 +58,6 @@ func InitializeRedigo() (*RedigoDB, error) {
 	database.prefixIndex = indexes[1]
 	database.suffixIndex = indexes[2]
 
-	// Define initialization steps with their error handling
 	initSteps := []types.InitializationStep{
 		{
 			Name: "snapshot",
@@ -92,7 +89,6 @@ func InitializeRedigo() (*RedigoDB, error) {
 			Function: func() error {
 				if err := database.LoadIndexesFromFile(); err != nil {
 					fmt.Printf("Failed to load indexes: %v\n", err)
-					// Non-critical error, continue
 				}
 				return nil
 			},
@@ -121,14 +117,12 @@ func InitializeRedigo() (*RedigoDB, error) {
 	return database, nil
 }
 
-// Adds a key-value pair to the reverse indexes using functional approach
 func (database *RedigoDB) addToIndex(key string, value any) {
 	database.indexMutex.Lock()
 	defer database.indexMutex.Unlock()
 
 	valueStr := utils.ValueToString(value)
 
-	// Define index operations functionally
 	indexOperations := []types.IndexOperation{
 		{
 			Name:  "value",
@@ -185,14 +179,12 @@ func (database *RedigoDB) addToIndex(key string, value any) {
 	)
 }
 
-// Removes a key from all reverse indexes using functional approach
 func (database *RedigoDB) removeFromIndex(key string, value any) {
 	database.indexMutex.Lock()
 	defer database.indexMutex.Unlock()
 
 	valueStr := utils.ValueToString(value)
 
-	// Define index removal operations functionally
 	indexRemovalOps := []types.IndexOperation{
 		{
 			Name:  "value",
@@ -232,11 +224,10 @@ func (database *RedigoDB) removeFromIndex(key string, value any) {
 					if entry, exists := operation.Index.Entries[indexKey]; exists {
 						delete(entry.Keys, key)
 
-						// Remove entry if no keys left
 						lo.Ternary(
 							len(entry.Keys) == 0,
 							func() { delete(operation.Index.Entries, indexKey) },
-							func() { /* keep entry */ },
+							func() { /* nothing */ },
 						)()
 					}
 				},
@@ -245,7 +236,6 @@ func (database *RedigoDB) removeFromIndex(key string, value any) {
 	)
 }
 
-// SafeRemoveKey removes a key from store and expiration keys with mutex protection
 func (database *RedigoDB) SafeRemoveKey(key string) {
 	database.storeMutex.Lock()
 	defer database.storeMutex.Unlock()
@@ -263,9 +253,7 @@ func (database *RedigoDB) SafeRemoveKey(key string) {
 	)
 }
 
-// UnsafeRemoveKey removes a key from store and expiration keys without mutex protection
 func (database *RedigoDB) UnsafeRemoveKey(key string) {
-	// Use functional approach to remove from multiple maps
 	cleanupActions := []func(){
 		func() { delete(database.store, key) },
 		func() { delete(database.expirationKeys, key) },
@@ -279,9 +267,7 @@ func (database *RedigoDB) UnsafeRemoveKey(key string) {
 	)
 }
 
-// ForceSave forces the database to save its state to a snapshot file using functional approach
 func (database *RedigoDB) ForceSave() error {
-	// Use functional error handling with lo.Ternary
 	return lo.Ternary(
 		func() error {
 			return database.UpdateSnapshot()

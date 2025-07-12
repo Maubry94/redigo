@@ -17,7 +17,6 @@ type SetTypeResolution struct {
 	found     bool
 }
 
-// Set stores a key-value pair in the database with optional TTL
 func (database *RedigoDB) Set(key string, value any, ttl int64) error {
 	now := time.Now().Unix()
 
@@ -37,7 +36,6 @@ func (database *RedigoDB) Set(key string, value any, ttl int64) error {
 		func() { delete(database.expirationKeys, key) },
 	)()
 
-	// Determine value type
 	valueTypeMapping := map[string]func(any) (string, any, bool){
 		"string": func(value any) (string, any, bool) {
 			if val, ok := value.(string); ok {
@@ -65,7 +63,6 @@ func (database *RedigoDB) Set(key string, value any, ttl int64) error {
 		},
 	}
 
-	// Find the appropriate type mapper
 	typeResult := lo.Reduce(
 		lo.Keys(valueTypeMapping),
 		func(
@@ -104,7 +101,6 @@ func (database *RedigoDB) Set(key string, value any, ttl int64) error {
 	return nil
 }
 
-// Get retrieves a value by key from the database
 func (database *RedigoDB) Get(key string) (any, error) {
 	database.storeMutex.Lock()
 	defer database.storeMutex.Unlock()
@@ -128,7 +124,6 @@ func (database *RedigoDB) Get(key string) (any, error) {
 				return nil, errors.ErrorKeyExpired
 			},
 			func() (any, error) {
-				// Key exists and is not expired, return it
 				if val, ok := database.store[key]; ok {
 					return val, nil
 				}
@@ -137,7 +132,6 @@ func (database *RedigoDB) Get(key string) (any, error) {
 		)()
 	}
 
-	// Retrieve value from store
 	value, ok := database.store[key]
 	return lo.Ternary(
 		ok,
@@ -150,16 +144,13 @@ func (database *RedigoDB) Get(key string) (any, error) {
 	)()
 }
 
-// Delete removes a key-value pair from the store
 func (database *RedigoDB) Delete(key string) bool {
 	database.storeMutex.Lock()
 	defer database.storeMutex.Unlock()
 
 	if value, exists := database.store[key]; exists {
-		// Remove from reverse indexes before deleting
 		database.removeFromIndex(key, value)
 
-		// Remove from both store and expiration tracking
 		database.UnsafeRemoveKey(key)
 
 		command := types.Command{
@@ -176,12 +167,10 @@ func (database *RedigoDB) Delete(key string) bool {
 	return false
 }
 
-// SetExpiry sets an expiration time for an existing key
 func (database *RedigoDB) SetExpiry(key string, seconds int64) bool {
 	database.storeMutex.Lock()
 	defer database.storeMutex.Unlock()
 
-	// Verify key exists before setting expiration
 	_, exists := database.store[key]
 	if !exists {
 		return false
@@ -197,16 +186,15 @@ func (database *RedigoDB) SetExpiry(key string, seconds int64) bool {
 			return true
 		},
 		"negative": func(s int64) bool {
-			return false // Invalid expiration
+			return false
 		},
 	}
 
-	// Determine expiration type and apply appropriate handler
 	expirationResult := lo.Reduce(
 		[]string{"positive", "zero", "negative"},
 		func(acc bool, handlerType string, _ int) bool {
 			if acc {
-				return acc // Already processed
+				return acc
 			}
 
 			shouldHandle := lo.Switch[string, bool](handlerType).
@@ -241,7 +229,6 @@ func (database *RedigoDB) SetExpiry(key string, seconds int64) bool {
 	return true
 }
 
-// SearchByValue finds all keys that have the specified value
 func (database *RedigoDB) SearchByValue(value string) []string {
 	database.indexMutex.RLock()
 	defer database.indexMutex.RUnlock()
@@ -257,7 +244,6 @@ func (database *RedigoDB) SearchByValue(value string) []string {
 	)()
 }
 
-// SearchByKeyPrefix finds all keys that start with the specified prefix
 func (database *RedigoDB) SearchByKeyPrefix(prefix string) []string {
 	database.indexMutex.RLock()
 	defer database.indexMutex.RUnlock()
@@ -273,7 +259,6 @@ func (database *RedigoDB) SearchByKeyPrefix(prefix string) []string {
 	)()
 }
 
-// SearchByKeySuffix finds all keys that end with the specified suffix
 func (database *RedigoDB) SearchByKeySuffix(suffix string) []string {
 	database.indexMutex.RLock()
 	defer database.indexMutex.RUnlock()
@@ -289,7 +274,6 @@ func (database *RedigoDB) SearchByKeySuffix(suffix string) []string {
 	)()
 }
 
-// SearchByKeyContains finds all keys that contain the specified substring
 func (database *RedigoDB) SearchByKeyContains(substring string) []string {
 	database.indexMutex.RLock()
 	defer database.indexMutex.RUnlock()
@@ -297,7 +281,6 @@ func (database *RedigoDB) SearchByKeyContains(substring string) []string {
 	database.storeMutex.Lock()
 	defer database.storeMutex.Unlock()
 
-	// Use lo.Filter to find keys containing the substring
 	return lo.Filter(
 		lo.Keys(database.store),
 		func(key string, _ int) bool {
@@ -306,9 +289,7 @@ func (database *RedigoDB) SearchByKeyContains(substring string) []string {
 	)
 }
 
-// DeserializeCommandValue deserializes a command value
 func DeserializeCommandValue(commandValue types.CommandValue) (any, error) {
-	// Define type-specific deserializers
 	deserializers := map[string]func(any) (any, error){
 		"string": func(value any) (any, error) {
 			if stringValue, ok := value.(string); ok {

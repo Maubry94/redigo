@@ -59,7 +59,6 @@ func (database *RedigoDB) LoadIndexesFromFile() error {
 		return fmt.Errorf("failed to get index file path: %w", err)
 	}
 
-	// Check if the indexes file exists
 	if _, err := os.Stat(indexesPath); os.IsNotExist(err) {
 		fmt.Println("No index file found, continuing with empty indexes")
 		return nil

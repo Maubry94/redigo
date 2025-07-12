@@ -5,12 +5,10 @@ import (
 	"strconv"
 )
 
-// Converts string value to int64
 func FromStringToInt64(value string) (int64, error) {
 	return strconv.ParseInt(value, 10, 64)
 }
 
-// Converts a value to string for indexing
 func ValueToString(value any) string {
 	switch v := value.(type) {
 	case string:
