@@ -33,26 +33,18 @@ func (database *RedigoDB) UpdateSnapshot() error {
 
 	now := time.Now().Unix()
 
-	snapshot := lo.FilterMap(
-		lo.Entries(database.store),
-		func(entry lo.Entry[string, any], _ int) (lo.Entry[string, map[string]any], bool) {
-			key, value := entry.Key, entry.Value
+	snapshotMap := make(map[string]map[string]any)
 
-			if expireTime, exists := database.expirationKeys[key]; exists && now > expireTime {
-				database.UnsafeRemoveKey(key)
-				return lo.Entry[string, map[string]any]{}, false
-			}
+	for key, value := range database.store {
+		if expireTime, exists := database.expirationKeys[key]; exists && now > expireTime {
+			database.UnsafeRemoveKey(key)
+			continue
+		}
 
-			return lo.Entry[string, map[string]any]{
-				Key: key,
-				Value: map[string]any{
-					"value": value,
-				},
-			}, true
-		},
-	)
-
-	snapshotMap := lo.FromEntries(snapshot)
+		snapshotMap[key] = map[string]any{
+			"value": value,
+		}
+	}
 
 	jsonData, err := json.MarshalIndent(snapshotMap, "", "  ")
 	if err != nil {
